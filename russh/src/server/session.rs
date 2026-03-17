@@ -750,7 +750,7 @@ impl Session {
 
     pub fn flush_pending(&mut self, channel: ChannelId) -> Result<usize, Error> {
         if let Some(ref mut enc) = self.common.encrypted {
-            enc.flush_pending(channel)
+            enc.flush_pending(channel, &mut self.common.packet_writer)
         } else {
             Ok(0)
         }
@@ -918,7 +918,7 @@ impl Session {
     /// processed by the event loop) is returned.
     pub fn data(&mut self, channel: ChannelId, data: impl Into<bytes::Bytes>) -> Result<(), Error> {
         if let Some(ref mut enc) = self.common.encrypted {
-            enc.data(channel, data, self.kex.active())
+            enc.data(channel, data, self.kex.active(), &mut self.common.packet_writer)
         } else {
             unreachable!()
         }
@@ -937,7 +937,13 @@ impl Session {
         data: impl Into<bytes::Bytes>,
     ) -> Result<(), Error> {
         if let Some(ref mut enc) = self.common.encrypted {
-            enc.extended_data(channel, extended, data, self.kex.active())
+            enc.extended_data(
+                channel,
+                extended,
+                data,
+                self.kex.active(),
+                &mut self.common.packet_writer,
+            )
         } else {
             unreachable!()
         }
