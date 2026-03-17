@@ -14,6 +14,7 @@
 //
 use std::borrow::Cow;
 
+use bytes::Bytes;
 use log::debug;
 use rand::RngCore;
 use ssh_encoding::{Decode, Encode};
@@ -419,7 +420,7 @@ pub(crate) fn write_kex(
     prefs: &Preferred,
     writer: &mut PacketWriter,
     server_config: Option<&Config>,
-) -> Result<Vec<u8>, Error> {
+) -> Result<Bytes, Error> {
     writer.packet(|w| {
         // buf.clear();
         msg::KEXINIT.encode(w)?;
