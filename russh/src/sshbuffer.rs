@@ -16,6 +16,7 @@
 use core::fmt;
 use std::num::Wrapping;
 
+use bytes::Bytes;
 use cipher::SealingKey;
 use compression::Compress;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
@@ -108,6 +109,7 @@ pub(crate) struct IncomingSshPacket {
 pub(crate) struct PacketWriter {
     cipher: Box<dyn SealingKey + Send>,
     compress: Compress,
+    packet_buffer: Vec<u8>,
     compress_buffer: Vec<u8>,
     write_buffer: SSHBuffer,
 }
@@ -127,8 +129,24 @@ impl PacketWriter {
         Self {
             cipher,
             compress,
+            packet_buffer: Vec::new(),
             compress_buffer: Vec::new(),
             write_buffer: SSHBuffer::new(),
+        }
+    }
+
+    fn prepare_packet<F: FnOnce(&mut Vec<u8>) -> Result<(), Error>>(
+        &mut self,
+        f: F,
+    ) -> Result<Vec<u8>, Error> {
+        let mut buf = std::mem::take(&mut self.packet_buffer);
+        buf.clear();
+        match f(&mut buf) {
+            Ok(()) => Ok(buf),
+            Err(err) => {
+                self.packet_buffer = buf;
+                Err(err)
+            }
         }
     }
 
@@ -141,16 +159,26 @@ impl PacketWriter {
         Ok(())
     }
 
-    /// Sends and returns the packet contents.
-    /// Packet buffer is not secret — use Vec<u8> for performance.
+    /// Sends a packet using the reusable plaintext packet buffer.
+    pub fn write_packet<F: FnOnce(&mut Vec<u8>) -> Result<(), Error>>(
+        &mut self,
+        f: F,
+    ) -> Result<(), Error> {
+        let buf = self.prepare_packet(f)?;
+        let result = self.packet_raw(&buf);
+        self.packet_buffer = buf;
+        result
+    }
+
+    /// Sends and returns the packet contents for callers that need to retain
+    /// the plaintext packet after it has been queued for encryption.
     pub fn packet<F: FnOnce(&mut Vec<u8>) -> Result<(), Error>>(
         &mut self,
         f: F,
-    ) -> Result<Vec<u8>, Error> {
-        let mut buf = Vec::new();
-        f(&mut buf)?;
+    ) -> Result<Bytes, Error> {
+        let buf = self.prepare_packet(f)?;
         self.packet_raw(&buf)?;
-        Ok(buf)
+        Ok(buf.into())
     }
 
     pub fn buffer(&mut self) -> &mut SSHBuffer {
