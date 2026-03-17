@@ -307,7 +307,9 @@ pub(crate) async fn read<R: AsyncRead + Unpin>(
 pub(crate) const PACKET_LENGTH_LEN: usize = 4;
 
 const MINIMUM_PACKET_LEN: usize = 16;
-const MAXIMUM_PACKET_LEN: usize = 256 * 1024;
+// `packet_length` includes the SSH message framing and padding, so a full
+// 256 KiB channel packet needs a little headroom at the transport layer.
+const MAXIMUM_PACKET_LEN: usize = 256 * 1024 + 32;
 
 const PADDING_LENGTH_LEN: usize = 1;
 
