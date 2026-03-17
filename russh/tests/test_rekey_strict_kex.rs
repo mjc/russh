@@ -11,6 +11,8 @@ use russh::keys::PrivateKeyWithHashAlg;
 use russh::keys::ssh_key::rand_core::OsRng;
 use russh::*;
 use ssh_key::PrivateKey;
+use tokio::sync::oneshot;
+use tokio::time::{Duration, timeout};
 
 #[tokio::test]
 async fn test_rekey_with_strict_kex() {
@@ -111,8 +113,103 @@ async fn test_rekey_with_strict_kex() {
         .unwrap();
 }
 
+#[tokio::test]
+async fn test_rekey_flushes_pending_channel_data_with_new_keys() {
+    let _ = env_logger::try_init();
+
+    let client_key = PrivateKey::random(&mut OsRng, ssh_key::Algorithm::Ed25519).unwrap();
+    let payload = vec![0x5a; 128 * 1024];
+    let expected_len = payload.len();
+    let (received_tx, received_rx) = oneshot::channel();
+
+    let mut server_config = server::Config::default();
+    server_config.inactivity_timeout = None;
+    server_config.auth_rejection_time = std::time::Duration::from_secs(3);
+    server_config.window_size = 1024;
+    server_config.maximum_packet_size = 256;
+    server_config
+        .keys
+        .push(PrivateKey::random(&mut OsRng, ssh_key::Algorithm::Ed25519).unwrap());
+    server_config.preferred = {
+        let mut p = Preferred::default();
+        p.kex = Cow::Borrowed(&[kex::CURVE25519, kex::EXTENSION_OPENSSH_STRICT_KEX_AS_SERVER]);
+        p
+    };
+    let server_config = Arc::new(server_config);
+
+    let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = socket.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        let (socket, _) = socket.accept().await.unwrap();
+        server::run_stream(
+            server_config,
+            socket,
+            PendingDataServer::new(expected_len, received_tx),
+        )
+        .await
+        .unwrap();
+    });
+
+    let mut client_config = client::Config::default();
+    client_config.window_size = 1024;
+    client_config.maximum_packet_size = 256;
+    client_config.preferred = {
+        let mut p = Preferred::default();
+        p.kex = Cow::Borrowed(&[kex::CURVE25519, kex::EXTENSION_OPENSSH_STRICT_KEX_AS_CLIENT]);
+        p
+    };
+    let client_config = Arc::new(client_config);
+
+    let mut session = client::connect(client_config, addr, TestClient {})
+        .await
+        .unwrap();
+
+    let authenticated = session
+        .authenticate_publickey(
+            std::env::var("USER").unwrap_or("user".to_owned()),
+            PrivateKeyWithHashAlg::new(Arc::new(client_key), None),
+        )
+        .await
+        .unwrap()
+        .success();
+    assert!(authenticated);
+
+    let channel = session.channel_open_session().await.unwrap();
+    session.rekey_soon().await.unwrap();
+    channel.data(&payload[..]).await.unwrap();
+
+    let received = timeout(Duration::from_secs(10), received_rx)
+        .await
+        .expect("timed out waiting for server payload")
+        .expect("server receiver dropped");
+    assert_eq!(received, payload);
+
+    channel.eof().await.unwrap();
+    session
+        .disconnect(Disconnect::ByApplication, "", "")
+        .await
+        .unwrap();
+}
+
 #[derive(Clone)]
 struct TestServer {}
+
+struct PendingDataServer {
+    expected_len: usize,
+    received: Vec<u8>,
+    received_tx: Option<oneshot::Sender<Vec<u8>>>,
+}
+
+impl PendingDataServer {
+    fn new(expected_len: usize, received_tx: oneshot::Sender<Vec<u8>>) -> Self {
+        Self {
+            expected_len,
+            received: Vec::with_capacity(expected_len),
+            received_tx: Some(received_tx),
+        }
+    }
+}
 
 // Insecure server that accepts any public key and echos back data it receives; ONLY FOR TESTS
 impl server::Handler for TestServer {
@@ -142,6 +239,41 @@ impl server::Handler for TestServer {
     ) -> Result<(), Self::Error> {
         // Echo back the data
         session.data(channel, data.to_vec())?;
+        Ok(())
+    }
+}
+
+impl server::Handler for PendingDataServer {
+    type Error = russh::Error;
+
+    async fn auth_publickey(
+        &mut self,
+        _user: &str,
+        _public_key: &ssh_key::PublicKey,
+    ) -> Result<server::Auth, Self::Error> {
+        Ok(server::Auth::Accept)
+    }
+
+    async fn channel_open_session(
+        &mut self,
+        _channel: Channel<server::Msg>,
+        _session: &mut server::Session,
+    ) -> Result<bool, Self::Error> {
+        Ok(true)
+    }
+
+    async fn data(
+        &mut self,
+        _channel: ChannelId,
+        data: &[u8],
+        _session: &mut server::Session,
+    ) -> Result<(), Self::Error> {
+        self.received.extend_from_slice(data);
+        if self.received.len() >= self.expected_len {
+            if let Some(tx) = self.received_tx.take() {
+                let _ = tx.send(std::mem::take(&mut self.received));
+            }
+        }
         Ok(())
     }
 }
