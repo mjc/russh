@@ -18,6 +18,7 @@ use std::fmt::{Debug, Formatter};
 use std::mem::replace;
 use std::num::Wrapping;
 
+use bytes::Bytes;
 use byteorder::{BigEndian, ByteOrder};
 use log::{debug, trace};
 use ssh_encoding::Encode;
@@ -490,23 +491,19 @@ impl Encrypted {
             let chunk = &buf[..off];
             let recipient_channel = channel.recipient_channel;
             match a {
-                None => {
-                    let _ = writer.packet(|write| {
-                        msg::CHANNEL_DATA.encode(write)?;
-                        recipient_channel.encode(write)?;
-                        chunk.encode(write)?;
-                        Ok(())
-                    })?;
-                }
-                Some(ext) => {
-                    let _ = writer.packet(|write| {
-                        msg::CHANNEL_EXTENDED_DATA.encode(write)?;
-                        recipient_channel.encode(write)?;
-                        ext.encode(write)?;
-                        chunk.encode(write)?;
-                        Ok(())
-                    })?;
-                }
+                None => writer.write_packet(|write| {
+                    msg::CHANNEL_DATA.encode(write)?;
+                    recipient_channel.encode(write)?;
+                    chunk.encode(write)?;
+                    Ok(())
+                })?,
+                Some(ext) => writer.write_packet(|write| {
+                    msg::CHANNEL_EXTENDED_DATA.encode(write)?;
+                    recipient_channel.encode(write)?;
+                    ext.encode(write)?;
+                    chunk.encode(write)?;
+                    Ok(())
+                })?,
             }
             trace!(
                 "buffer: {:?} {:?}",
@@ -526,7 +523,7 @@ impl Encrypted {
     pub fn data(
         &mut self,
         channel: ChannelId,
-        buf0: impl Into<bytes::Bytes>,
+        buf0: impl Into<Bytes>,
         is_rekeying: bool,
         writer: &mut PacketWriter,
     ) -> Result<(), crate::Error> {
@@ -556,7 +553,7 @@ impl Encrypted {
         &mut self,
         channel: ChannelId,
         ext: u32,
-        buf0: impl Into<bytes::Bytes>,
+        buf0: impl Into<Bytes>,
         is_rekeying: bool,
         writer: &mut PacketWriter,
     ) -> Result<(), crate::Error> {
@@ -666,8 +663,8 @@ pub struct Exchange {
     // They carry no secret material and do not require mlock.
     pub client_id: Vec<u8>,
     pub server_id: Vec<u8>,
-    pub client_kex_init: Vec<u8>,
-    pub server_kex_init: Vec<u8>,
+    pub client_kex_init: Bytes,
+    pub server_kex_init: Bytes,
     pub client_ephemeral: Vec<u8>,
     pub server_ephemeral: Vec<u8>,
     pub gex: Option<(GexParams, DhGroup)>,
