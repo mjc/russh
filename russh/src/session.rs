@@ -721,6 +721,7 @@ mod tests {
     use super::{Encrypted, EncryptedState, Exchange};
     use crate::compression::{Compression, Decompress};
     use crate::kex::{KEXES, NONE};
+    use crate::sshbuffer::PacketWriter;
     use crate::{ChannelId, ChannelParams, CryptoVec, mac, msg};
 
     fn test_encrypted() -> Encrypted {
@@ -808,21 +809,22 @@ mod tests {
     fn flush_pending_replays_deferred_eof_once() {
         let channel_id = ChannelId(10);
         let mut encrypted = test_encrypted();
+        let mut writer = PacketWriter::clear();
         encrypted
             .channels
             .insert(channel_id, test_channel(channel_id, 42, true, false));
 
-        encrypted.flush_pending(channel_id).unwrap();
+        encrypted.flush_pending(channel_id, &mut writer).unwrap();
         assert_eq!(
-            packet_types(&encrypted.write),
+            combined_packet_types(&encrypted, &mut writer),
             vec![msg::CHANNEL_DATA, msg::CHANNEL_EOF]
         );
         assert!(!encrypted.channels[&channel_id].pending_eof);
 
         // Second flush must not re-emit EOF.
-        encrypted.flush_pending(channel_id).unwrap();
+        encrypted.flush_pending(channel_id, &mut writer).unwrap();
         assert_eq!(
-            packet_types(&encrypted.write),
+            combined_packet_types(&encrypted, &mut writer),
             vec![msg::CHANNEL_DATA, msg::CHANNEL_EOF]
         );
     }
@@ -831,13 +833,14 @@ mod tests {
     fn flush_pending_replays_deferred_close_and_removes_channel() {
         let channel_id = ChannelId(11);
         let mut encrypted = test_encrypted();
+        let mut writer = PacketWriter::clear();
         encrypted
             .channels
             .insert(channel_id, test_channel(channel_id, 43, true, true));
 
-        encrypted.flush_pending(channel_id).unwrap();
+        encrypted.flush_pending(channel_id, &mut writer).unwrap();
         assert_eq!(
-            packet_types(&encrypted.write),
+            combined_packet_types(&encrypted, &mut writer),
             vec![msg::CHANNEL_DATA, msg::CHANNEL_EOF, msg::CHANNEL_CLOSE]
         );
         assert!(!encrypted.channels.contains_key(&channel_id));
@@ -848,14 +851,15 @@ mod tests {
         // Window smaller than data: flush is incomplete, EOF/CLOSE must not be sent.
         let channel_id = ChannelId(12);
         let mut encrypted = test_encrypted();
+        let mut writer = PacketWriter::clear();
         encrypted.channels.insert(
             channel_id,
             test_channel_windowed(channel_id, 44, 3, true, true),
         );
 
-        encrypted.flush_pending(channel_id).unwrap();
+        encrypted.flush_pending(channel_id, &mut writer).unwrap();
         // Only partial data fits; no EOF or CLOSE yet.
-        assert_eq!(packet_types(&encrypted.write), vec![msg::CHANNEL_DATA]);
+        assert_eq!(combined_packet_types(&encrypted, &mut writer), vec![msg::CHANNEL_DATA]);
         assert!(encrypted.channels.contains_key(&channel_id));
         assert!(encrypted.channels[&channel_id].pending_eof);
         assert!(encrypted.channels[&channel_id].pending_close);
@@ -863,24 +867,43 @@ mod tests {
 
     // flush_all_pending (multi-channel path)
 
+    fn output_packet_types(buf: &[u8]) -> Vec<u8> {
+        let mut packet_types = Vec::new();
+        let mut cursor = 0;
+
+        while cursor < buf.len() {
+            let packet_len = BigEndian::read_u32(&buf[cursor..cursor + 4]) as usize;
+            packet_types.push(buf[cursor + 5]);
+            cursor += 4 + packet_len;
+        }
+
+        packet_types
+    }
+
+    fn combined_packet_types(encrypted: &Encrypted, writer: &mut PacketWriter) -> Vec<u8> {
+        let mut types = output_packet_types(&writer.buffer().buffer);
+        types.extend(packet_types(&encrypted.write));
+        types
+    }
     #[test]
     fn flush_all_pending_replays_deferred_eof_once() {
         let channel_id = ChannelId(1);
         let mut encrypted = test_encrypted();
+        let mut writer = PacketWriter::clear();
         encrypted
             .channels
             .insert(channel_id, test_channel(channel_id, 42, true, false));
 
-        encrypted.flush_all_pending().unwrap();
+        encrypted.flush_all_pending(&mut writer).unwrap();
         assert_eq!(
-            packet_types(&encrypted.write),
+            combined_packet_types(&encrypted, &mut writer),
             vec![msg::CHANNEL_DATA, msg::CHANNEL_EOF]
         );
         assert!(!encrypted.channels[&channel_id].pending_eof);
 
-        encrypted.flush_all_pending().unwrap();
+        encrypted.flush_all_pending(&mut writer).unwrap();
         assert_eq!(
-            packet_types(&encrypted.write),
+            combined_packet_types(&encrypted, &mut writer),
             vec![msg::CHANNEL_DATA, msg::CHANNEL_EOF]
         );
     }
@@ -889,13 +912,14 @@ mod tests {
     fn flush_all_pending_replays_deferred_close_and_removes_channel() {
         let channel_id = ChannelId(2);
         let mut encrypted = test_encrypted();
+        let mut writer = PacketWriter::clear();
         encrypted
             .channels
             .insert(channel_id, test_channel(channel_id, 43, true, true));
 
-        encrypted.flush_all_pending().unwrap();
+        encrypted.flush_all_pending(&mut writer).unwrap();
         assert_eq!(
-            packet_types(&encrypted.write),
+            combined_packet_types(&encrypted, &mut writer),
             vec![msg::CHANNEL_DATA, msg::CHANNEL_EOF, msg::CHANNEL_CLOSE]
         );
         assert!(!encrypted.channels.contains_key(&channel_id));
