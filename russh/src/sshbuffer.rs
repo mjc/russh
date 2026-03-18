@@ -203,7 +203,9 @@ impl PacketWriter {
     ) -> Result<Bytes, Error> {
         let buf = self.prepare_packet(f)?;
         self.packet_raw(&buf)?;
-        Ok(buf.into())
+        let packet = Bytes::copy_from_slice(&buf);
+        self.packet_buffer = buf;
+        Ok(packet)
     }
 
     pub fn buffer(&mut self) -> &mut SSHBuffer {
