@@ -114,7 +114,7 @@ async fn test_rekey_with_strict_kex() {
 }
 
 #[tokio::test]
-async fn test_rekey_flushes_pending_channel_data_with_new_keys() {
+async fn test_rekey_flushes_pending_channel_data() {
     let _ = env_logger::try_init();
 
     let client_key = PrivateKey::random(&mut OsRng, ssh_key::Algorithm::Ed25519).unwrap();
