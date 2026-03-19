@@ -11,6 +11,7 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 const MAX_CHANNEL_PACKET_SIZE: u32 = 256 * 1024;
 const TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const STDERR_EXTENDED_DATA_TYPE: u32 = 1;
+#[cfg(feature = "flate2")]
 const ZLIB_ONLY: &[compression::Name] = &[compression::ZLIB];
 
 #[tokio::test]
@@ -19,6 +20,7 @@ async fn test_aes256_gcm_allows_full_256k_channel_packet() {
 }
 
 #[tokio::test]
+#[cfg(feature = "flate2")]
 async fn test_aes256_gcm_with_zlib_allows_full_256k_channel_packet() {
     run_max_channel_packet_size_test(Some(ZLIB_ONLY)).await;
 }
