@@ -528,21 +528,15 @@ impl Encrypted {
         channel: ChannelId,
         buf0: impl Into<bytes::Bytes>,
         is_rekeying: bool,
-        writer: &mut PacketWriter,
     ) -> Result<(), crate::Error> {
         let buf0 = buf0.into();
-        let can_direct_write = self.can_direct_write();
         if let Some(channel) = self.channels.get_mut(&channel) {
             assert!(channel.confirmed);
             if !channel.pending_data.is_empty() || is_rekeying {
                 channel.pending_data.push_back((buf0, None, 0));
                 return Ok(());
             }
-            let buf_len = if can_direct_write {
-                Self::data_noqueue_direct(writer, channel, &buf0, None, 0)?
-            } else {
-                Self::data_noqueue_staged(&mut self.write, channel, &buf0, None, 0)?
-            };
+            let buf_len = Self::data_noqueue_staged(&mut self.write, channel, &buf0, None, 0)?;
             if buf_len < buf0.len() {
                 channel.pending_data.push_back((buf0, None, buf_len))
             }
@@ -558,21 +552,15 @@ impl Encrypted {
         ext: u32,
         buf0: impl Into<bytes::Bytes>,
         is_rekeying: bool,
-        writer: &mut PacketWriter,
     ) -> Result<(), crate::Error> {
         let buf0 = buf0.into();
-        let can_direct_write = self.can_direct_write();
         if let Some(channel) = self.channels.get_mut(&channel) {
             assert!(channel.confirmed);
             if !channel.pending_data.is_empty() || is_rekeying {
                 channel.pending_data.push_back((buf0, Some(ext), 0));
                 return Ok(());
             }
-            let buf_len = if can_direct_write {
-                Self::data_noqueue_direct(writer, channel, &buf0, Some(ext), 0)?
-            } else {
-                Self::data_noqueue_staged(&mut self.write, channel, &buf0, Some(ext), 0)?
-            };
+            let buf_len = Self::data_noqueue_staged(&mut self.write, channel, &buf0, Some(ext), 0)?;
             if buf_len < buf0.len() {
                 channel.pending_data.push_back((buf0, Some(ext), buf_len))
             }

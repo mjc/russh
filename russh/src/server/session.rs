@@ -918,7 +918,7 @@ impl Session {
     /// processed by the event loop) is returned.
     pub fn data(&mut self, channel: ChannelId, data: impl Into<bytes::Bytes>) -> Result<(), Error> {
         if let Some(ref mut enc) = self.common.encrypted {
-            enc.data(channel, data, self.kex.active(), &mut self.common.packet_writer)
+            enc.data(channel, data, self.kex.active())
         } else {
             unreachable!()
         }
@@ -937,13 +937,7 @@ impl Session {
         data: impl Into<bytes::Bytes>,
     ) -> Result<(), Error> {
         if let Some(ref mut enc) = self.common.encrypted {
-            enc.extended_data(
-                channel,
-                extended,
-                data,
-                self.kex.active(),
-                &mut self.common.packet_writer,
-            )
+            enc.extended_data(channel, extended, data, self.kex.active())
         } else {
             unreachable!()
         }

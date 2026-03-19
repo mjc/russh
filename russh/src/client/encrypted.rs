@@ -854,7 +854,7 @@ impl Session {
                     accepted,
                     ref mut sent,
                 } => {
-                    debug!("sending ssh-userauth service requset");
+                    debug!("sending ssh-userauth service request");
                     if !*sent {
                         push_packet!(enc.write, {
                             msg::SERVICE_REQUEST.encode(&mut enc.write)?;
