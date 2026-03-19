@@ -551,7 +551,7 @@ impl Session {
                 }
 
                 if let Some(ref mut enc) = self.common.encrypted {
-                    new_size -= enc.flush_pending(channel_num)? as u32;
+                    new_size -= enc.flush_pending(channel_num, &mut self.common.packet_writer)? as u32;
                 }
                 if let Some(chan) = self.channels.get(&channel_num) {
                     chan.window_size().update(new_size).await;
@@ -854,13 +854,12 @@ impl Session {
                     accepted,
                     ref mut sent,
                 } => {
-                    debug!("sending ssh-userauth service requset");
+                    debug!("sending ssh-userauth service request");
                     if !*sent {
-                        self.common.packet_writer.packet(|w| {
-                            msg::SERVICE_REQUEST.encode(w)?;
-                            "ssh-userauth".encode(w)?;
-                            Ok(())
-                        })?;
+                        push_packet!(enc.write, {
+                            msg::SERVICE_REQUEST.encode(&mut enc.write)?;
+                            "ssh-userauth".encode(&mut enc.write)?;
+                        });
                         *sent = true
                     }
                     accepted

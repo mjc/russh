@@ -750,7 +750,7 @@ impl Session {
 
     pub fn flush_pending(&mut self, channel: ChannelId) -> Result<usize, Error> {
         if let Some(ref mut enc) = self.common.encrypted {
-            enc.flush_pending(channel)
+            enc.flush_pending(channel, &mut self.common.packet_writer)
         } else {
             Ok(0)
         }
