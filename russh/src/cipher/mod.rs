@@ -209,32 +209,30 @@ pub(crate) trait SealingKey {
 
     fn seal(&mut self, seqn: u32, plaintext_in_ciphertext_out: &mut [u8], tag_out: &mut [u8]);
 
-    fn write(&mut self, payload: &[u8], buffer: &mut SSHBuffer) {
-        // https://tools.ietf.org/html/rfc4253#section-6
-        //
-        // The variables `payload`, `packet_length` and `padding_length` refer
-        // to the protocol fields of the same names.
-        trace!("writing, seqn = {:?}", buffer.seqn.0);
+    fn finish_packet(&mut self, offset: usize, payload_len: usize, buffer: &mut SSHBuffer) {
+        let payload_start = offset + PACKET_LENGTH_LEN + PADDING_LENGTH_LEN;
+        let payload_end = payload_start + payload_len;
 
-        let padding_length = self.padding_length(payload);
+        trace!("writing, seqn = {:?}", buffer.seqn.0);
+        let padding_length = self.padding_length(&buffer.buffer[payload_start..payload_end]);
         trace!("padding length {padding_length:?}");
-        let packet_length = PADDING_LENGTH_LEN + payload.len() + padding_length;
+        let packet_length = PADDING_LENGTH_LEN + payload_len + padding_length;
         trace!("packet_length {packet_length:?}");
-        let offset = buffer.buffer.len();
 
         // Maximum packet length:
         // https://tools.ietf.org/html/rfc4253#section-6.1
         assert!(packet_length <= u32::MAX as usize);
         #[allow(clippy::unwrap_used)] // length checked
-        (packet_length as u32).encode(&mut buffer.buffer).unwrap();
+        BigEndian::write_u32(
+            (&mut buffer.buffer[offset..offset + PACKET_LENGTH_LEN]).try_into().unwrap(),
+            packet_length as u32,
+        );
 
         assert!(padding_length <= u8::MAX as usize);
-        buffer.buffer.push(padding_length as u8);
-        buffer.buffer.extend_from_slice(payload);
-        let pad_offset = buffer.buffer.len();
-        buffer.buffer.resize(pad_offset + padding_length, 0);
+        buffer.buffer[offset + PACKET_LENGTH_LEN] = padding_length as u8;
+        buffer.buffer.resize(payload_end + padding_length, 0);
         #[allow(clippy::indexing_slicing)] // length checked
-        self.fill_padding(&mut buffer.buffer[pad_offset..]);
+        self.fill_padding(&mut buffer.buffer[payload_end..]);
         let tag_offset = buffer.buffer.len();
         buffer.buffer.resize(tag_offset + self.tag_len(), 0);
 
@@ -244,10 +242,21 @@ pub(crate) trait SealingKey {
 
         self.seal(buffer.seqn.0, plaintext, tag);
 
-        buffer.bytes += payload.len();
+        buffer.bytes += payload_len;
         // Sequence numbers are on 32 bits and wrap.
         // https://tools.ietf.org/html/rfc4253#section-6.4
         buffer.seqn += Wrapping(1);
+    }
+
+    fn write(&mut self, payload: &[u8], buffer: &mut SSHBuffer) {
+        // https://tools.ietf.org/html/rfc4253#section-6
+        //
+        // The variables `payload`, `packet_length` and `padding_length` refer
+        // to the protocol fields of the same names.
+        let offset = buffer.buffer.len();
+        buffer.buffer.resize(offset + PACKET_LENGTH_LEN + PADDING_LENGTH_LEN, 0);
+        buffer.buffer.extend_from_slice(payload);
+        self.finish_packet(offset, payload.len(), buffer);
     }
 }
 
