@@ -946,6 +946,30 @@ mod tests {
     }
 
     #[test]
+    fn flush_pending_uses_staged_path_when_write_buffer_nonempty() {
+        // When enc.write already has data (can_direct_write == false),
+        // flush_channel must use data_noqueue_staged (appending to enc.write)
+        // rather than data_noqueue_direct, so the two output streams stay
+        // in order.
+        let channel_id = ChannelId(6);
+        let mut encrypted = test_encrypted();
+        let mut writer = PacketWriter::clear();
+        encrypted
+            .channels
+            .insert(channel_id, test_channel(channel_id, 42, false, false));
+
+        // Simulate in-progress staged write so can_direct_write() returns false.
+        // Setting write_cursor non-zero is enough without corrupting enc.write.
+        encrypted.write_cursor = 1;
+
+        encrypted.flush_pending(channel_id, &mut writer).unwrap();
+
+        // Pending data must have gone into enc.write (staged path), not writer.
+        assert!(writer.buffer().buffer.is_empty());
+        assert!(combined_packet_types(&encrypted, &mut writer).contains(&msg::CHANNEL_DATA));
+    }
+
+    #[test]
     fn data_queues_behind_existing_pending_data_when_not_rekeying() {
         // If pending_data is non-empty, new data must be queued rather than
         // sent immediately, even when not rekeying, to preserve ordering.
