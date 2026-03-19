@@ -361,39 +361,25 @@ impl Encrypted {
         Ok(())
     }
 
-    pub fn flush_pending(
-        &mut self,
-        channel: ChannelId,
-    ) -> Result<usize, crate::Error> {
-        let mut pending_size = 0;
-        let mut maybe_flush_result = Option::<ChannelFlushResult>::None;
-
-        if let Some(channel) = self.channels.get_mut(&channel) {
-            let flush_result = Self::flush_channel(None, &mut self.write, channel)?;
-            pending_size += flush_result.wrote();
-            maybe_flush_result = Some(flush_result);
-        }
-        if let Some(flush_result) = maybe_flush_result {
-            self.handle_flushed_channel(channel, flush_result)?;
-        }
-        Ok(pending_size)
+    pub fn flush_pending(&mut self, channel: ChannelId) -> Result<usize, crate::Error> {
+        let flush_result = match self.channels.get_mut(&channel) {
+            Some(ch) => Self::flush_channel(None, &mut self.write, ch)?,
+            None => return Ok(0),
+        };
+        let wrote = flush_result.wrote();
+        self.handle_flushed_channel(channel, flush_result)?;
+        Ok(wrote)
     }
 
     pub fn flush_all_pending(&mut self, writer: &mut PacketWriter) -> Result<(), crate::Error> {
-        let mut writer: Option<&mut PacketWriter> = if self.can_direct_write() {
-            Some(writer)
-        } else {
-            None
-        };
-        let mut completed_channels = Vec::new();
-        for (&channel_id, channel) in &mut self.channels {
-            let flush_result =
-                Self::flush_channel(writer.as_deref_mut(), &mut self.write, channel)?;
-            if matches!(flush_result, ChannelFlushResult::Complete { .. }) {
-                completed_channels.push((channel_id, flush_result));
-            }
-        }
-        for (channel_id, flush_result) in completed_channels {
+        let can_direct = self.can_direct_write();
+        let channel_ids: Vec<ChannelId> = self.channels.keys().copied().collect();
+        for channel_id in channel_ids {
+            let w: Option<&mut PacketWriter> = if can_direct { Some(&mut *writer) } else { None };
+            let flush_result = match self.channels.get_mut(&channel_id) {
+                Some(ch) => Self::flush_channel(w, &mut self.write, ch)?,
+                None => continue,
+            };
             self.handle_flushed_channel(channel_id, flush_result)?;
         }
         Ok(())
