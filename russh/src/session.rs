@@ -18,6 +18,7 @@ use std::fmt::{Debug, Formatter};
 use std::mem::replace;
 use std::num::Wrapping;
 
+use bytes::Bytes;
 use byteorder::{BigEndian, ByteOrder};
 use log::{debug, trace};
 use ssh_encoding::Encode;
@@ -490,23 +491,19 @@ impl Encrypted {
             let chunk = &buf[..off];
             let recipient_channel = channel.recipient_channel;
             match a {
-                None => {
-                    let _ = writer.packet(|write| {
-                        msg::CHANNEL_DATA.encode(write)?;
-                        recipient_channel.encode(write)?;
-                        chunk.encode(write)?;
-                        Ok(())
-                    })?;
-                }
-                Some(ext) => {
-                    let _ = writer.packet(|write| {
-                        msg::CHANNEL_EXTENDED_DATA.encode(write)?;
-                        recipient_channel.encode(write)?;
-                        ext.encode(write)?;
-                        chunk.encode(write)?;
-                        Ok(())
-                    })?;
-                }
+                None => writer.write_packet(|write| {
+                    msg::CHANNEL_DATA.encode(write)?;
+                    recipient_channel.encode(write)?;
+                    chunk.encode(write)?;
+                    Ok(())
+                })?,
+                Some(ext) => writer.write_packet(|write| {
+                    msg::CHANNEL_EXTENDED_DATA.encode(write)?;
+                    recipient_channel.encode(write)?;
+                    ext.encode(write)?;
+                    chunk.encode(write)?;
+                    Ok(())
+                })?,
             }
             trace!(
                 "buffer: {:?} {:?}",
@@ -526,7 +523,7 @@ impl Encrypted {
     pub fn data(
         &mut self,
         channel: ChannelId,
-        buf0: impl Into<bytes::Bytes>,
+        buf0: impl Into<Bytes>,
         is_rekeying: bool,
     ) -> Result<(), crate::Error> {
         let buf0 = buf0.into();
@@ -550,7 +547,7 @@ impl Encrypted {
         &mut self,
         channel: ChannelId,
         ext: u32,
-        buf0: impl Into<bytes::Bytes>,
+        buf0: impl Into<Bytes>,
         is_rekeying: bool,
     ) -> Result<(), crate::Error> {
         let buf0 = buf0.into();
@@ -654,8 +651,8 @@ pub struct Exchange {
     // They carry no secret material and do not require mlock.
     pub client_id: Vec<u8>,
     pub server_id: Vec<u8>,
-    pub client_kex_init: Vec<u8>,
-    pub server_kex_init: Vec<u8>,
+    pub client_kex_init: Bytes,
+    pub server_kex_init: Bytes,
     pub client_ephemeral: Vec<u8>,
     pub server_ephemeral: Vec<u8>,
     pub gex: Option<(GexParams, DhGroup)>,
@@ -914,34 +911,43 @@ mod tests {
     }
 
     #[test]
-    fn flush_all_pending_handles_multiple_channels_independently() {
-        let eof_only = ChannelId(3);
-        let close_too = ChannelId(4);
+    fn flush_all_pending_replays_deferred_controls_across_channels() {
+        let channel_a = ChannelId(3);
+        let channel_b = ChannelId(4);
         let mut encrypted = test_encrypted();
         let mut writer = PacketWriter::clear();
         encrypted
             .channels
-            .insert(eof_only, test_channel(eof_only, 50, true, false));
+            .insert(channel_a, test_channel(channel_a, 44, true, false));
         encrypted
             .channels
-            .insert(close_too, test_channel(close_too, 51, true, true));
+            .insert(channel_b, test_channel(channel_b, 45, false, true));
 
         encrypted.flush_all_pending(&mut writer).unwrap();
 
-        // eof_only: data + EOF, channel still present
-        assert!(encrypted.channels.contains_key(&eof_only));
-        assert!(!encrypted.channels[&eof_only].pending_eof);
-
-        // close_too: data + EOF + CLOSE, channel removed
-        assert!(!encrypted.channels.contains_key(&close_too));
-
-        // Combined wire output contains both sets of packets (order may vary by map iteration).
-        let types = combined_packet_types(&encrypted, &mut writer);
-        assert_eq!(types.iter().filter(|&&t| t == msg::CHANNEL_DATA).count(), 2);
-        assert_eq!(types.iter().filter(|&&t| t == msg::CHANNEL_EOF).count(), 2);
+        let packet_types = combined_packet_types(&encrypted, &mut writer);
         assert_eq!(
-            types.iter().filter(|&&t| t == msg::CHANNEL_CLOSE).count(),
+            packet_types
+                .iter()
+                .filter(|&&msg_type| msg_type == msg::CHANNEL_DATA)
+                .count(),
+            2
+        );
+        assert_eq!(
+            packet_types
+                .iter()
+                .filter(|&&msg_type| msg_type == msg::CHANNEL_EOF)
+                .count(),
             1
         );
+        assert_eq!(
+            packet_types
+                .iter()
+                .filter(|&&msg_type| msg_type == msg::CHANNEL_CLOSE)
+                .count(),
+            1
+        );
+        assert!(encrypted.channels.contains_key(&channel_a));
+        assert!(!encrypted.channels.contains_key(&channel_b));
     }
 }
