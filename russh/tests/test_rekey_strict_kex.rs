@@ -461,6 +461,13 @@ impl server::Handler for PendingDataServer {
         _channel: ChannelId,
         _session: &mut server::Session,
     ) -> Result<(), Self::Error> {
+        // Assert all pending data was received before EOF, verifying deferred
+        // EOF replay ordering: data must arrive before EOF is signalled.
+        // received_tx is taken (set to None) once expected_len bytes arrive.
+        assert!(
+            self.received_tx.is_none(),
+            "EOF received before all pending data was delivered",
+        );
         if let Some(tx) = self.eof_tx.take() {
             let _ = tx.send(());
         }
@@ -472,6 +479,13 @@ impl server::Handler for PendingDataServer {
         _channel: ChannelId,
         _session: &mut server::Session,
     ) -> Result<(), Self::Error> {
+        // Assert all pending data was received before CLOSE, verifying deferred
+        // CLOSE replay ordering: data must arrive before CLOSE is signalled.
+        // received_tx is taken (set to None) once expected_len bytes arrive.
+        assert!(
+            self.received_tx.is_none(),
+            "CLOSE received before all pending data was delivered",
+        );
         if let Some(tx) = self.close_tx.take() {
             let _ = tx.send(());
         }
