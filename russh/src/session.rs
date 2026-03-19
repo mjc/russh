@@ -146,6 +146,22 @@ impl<C> CommonSession<C> {
         }
     }
 
+    /// Complete a rekey: install the new cipher, flush any pending channel
+    /// data with it, and record the rekey timestamp. No-op if not yet encrypted
+    /// (initial kex — caller handles that path separately).
+    pub fn rekey_flush(&mut self, newkeys: NewKeys) -> Result<(), crate::Error> {
+        if self.encrypted.is_none() {
+            return Ok(());
+        }
+        self.packet_writer.buffer().bytes = 0;
+        self.newkeys(newkeys);
+        if let Some(ref mut enc) = self.encrypted {
+            enc.last_rekey = std::time::Instant::now();
+            enc.flush_all_pending(&mut self.packet_writer)?;
+        }
+        Ok(())
+    }
+
     pub fn encrypted(&mut self, state: EncryptedState, newkeys: NewKeys) {
         let strict_kex = newkeys.names.strict_kex();
         self.encrypted = Some(Encrypted {

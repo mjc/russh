@@ -1117,15 +1117,7 @@ async fn reply<H: Handler + Send>(
 
                     if session.common.encrypted.is_some() {
                         // This is a rekey
-                        if let Some(ref mut enc) = session.common.encrypted {
-                            enc.last_rekey = Instant::now();
-                        }
-                        session.common.packet_writer.buffer().bytes = 0;
-                        session.common.newkeys(newkeys);
-                        if let Some(ref mut enc) = session.common.encrypted {
-                            enc.flush_all_pending(&mut session.common.packet_writer)?;
-                        }
-
+                        session.common.rekey_flush(newkeys)?;
                         let mut pending = std::mem::take(&mut session.pending_reads);
                         for p in pending.drain(..) {
                             session.process_packet(handler, &p).await?;
