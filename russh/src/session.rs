@@ -319,17 +319,15 @@ impl Encrypted {
     }
 
     fn flush_channel(
-        writer: &mut PacketWriter,
+        mut writer: Option<&mut PacketWriter>,
         write: &mut Vec<u8>,
-        can_direct_write: bool,
         channel: &mut ChannelParams,
     ) -> Result<ChannelFlushResult, crate::Error> {
         let mut pending_size = 0;
         while let Some((buf, a, from)) = channel.pending_data.pop_front() {
-            let size = if can_direct_write {
-                Self::data_noqueue_direct(writer, channel, &buf, a, from)?
-            } else {
-                Self::data_noqueue_staged(write, channel, &buf, a, from)?
+            let size = match writer {
+                Some(ref mut w) => Self::data_noqueue_direct(w, channel, &buf, a, from)?,
+                None => Self::data_noqueue_staged(write, channel, &buf, a, from)?,
             };
             pending_size += size;
             if from + size < buf.len() {
@@ -366,18 +364,12 @@ impl Encrypted {
     pub fn flush_pending(
         &mut self,
         channel: ChannelId,
-        writer: &mut PacketWriter,
     ) -> Result<usize, crate::Error> {
         let mut pending_size = 0;
         let mut maybe_flush_result = Option::<ChannelFlushResult>::None;
 
-        // Always use the staged path here: flush_pending is called from
-        // WINDOW_ADJUST handlers during normal operation where can_direct_write()
-        // may be true but direct-write would allocate a Vec per packet.
-        // Only flush_all_pending (called from newkeys) uses the direct path.
         if let Some(channel) = self.channels.get_mut(&channel) {
-            let flush_result =
-                Self::flush_channel(writer, &mut self.write, false, channel)?;
+            let flush_result = Self::flush_channel(None, &mut self.write, channel)?;
             pending_size += flush_result.wrote();
             maybe_flush_result = Some(flush_result);
         }
@@ -388,11 +380,15 @@ impl Encrypted {
     }
 
     pub fn flush_all_pending(&mut self, writer: &mut PacketWriter) -> Result<(), crate::Error> {
-        let can_direct_write = self.can_direct_write();
+        let mut writer: Option<&mut PacketWriter> = if self.can_direct_write() {
+            Some(writer)
+        } else {
+            None
+        };
         let mut completed_channels = Vec::new();
         for (&channel_id, channel) in &mut self.channels {
             let flush_result =
-                Self::flush_channel(writer, &mut self.write, can_direct_write, channel)?;
+                Self::flush_channel(writer.as_deref_mut(), &mut self.write, channel)?;
             if matches!(flush_result, ChannelFlushResult::Complete { .. }) {
                 completed_channels.push((channel_id, flush_result));
             }
@@ -805,7 +801,7 @@ mod tests {
             .channels
             .insert(channel_id, test_channel(channel_id, 42, true, false));
 
-        encrypted.flush_pending(channel_id, &mut writer).unwrap();
+        encrypted.flush_pending(channel_id).unwrap();
         assert_eq!(
             combined_packet_types(&encrypted, &mut writer),
             vec![msg::CHANNEL_DATA, msg::CHANNEL_EOF]
@@ -813,7 +809,7 @@ mod tests {
         assert!(!encrypted.channels[&channel_id].pending_eof);
 
         // Second flush must not re-emit EOF.
-        encrypted.flush_pending(channel_id, &mut writer).unwrap();
+        encrypted.flush_pending(channel_id).unwrap();
         assert_eq!(
             combined_packet_types(&encrypted, &mut writer),
             vec![msg::CHANNEL_DATA, msg::CHANNEL_EOF]
@@ -829,7 +825,7 @@ mod tests {
             .channels
             .insert(channel_id, test_channel(channel_id, 43, true, true));
 
-        encrypted.flush_pending(channel_id, &mut writer).unwrap();
+        encrypted.flush_pending(channel_id).unwrap();
         assert_eq!(
             combined_packet_types(&encrypted, &mut writer),
             vec![msg::CHANNEL_DATA, msg::CHANNEL_EOF, msg::CHANNEL_CLOSE]
@@ -848,7 +844,7 @@ mod tests {
             test_channel_windowed(channel_id, 44, 3, true, true),
         );
 
-        encrypted.flush_pending(channel_id, &mut writer).unwrap();
+        encrypted.flush_pending(channel_id).unwrap();
         // Only partial data fits; no EOF or CLOSE yet.
         assert_eq!(combined_packet_types(&encrypted, &mut writer), vec![msg::CHANNEL_DATA]);
         assert!(encrypted.channels.contains_key(&channel_id));
@@ -963,7 +959,7 @@ mod tests {
 
         // write buffer is empty, so can_direct_write() would be true — but
         // flush_pending must still stage into enc.write, not write via writer.
-        encrypted.flush_pending(channel_id, &mut writer).unwrap();
+        encrypted.flush_pending(channel_id).unwrap();
 
         assert!(writer.buffer().buffer.is_empty());
         assert!(combined_packet_types(&encrypted, &mut writer).contains(&msg::CHANNEL_DATA));
