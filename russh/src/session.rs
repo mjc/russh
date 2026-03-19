@@ -937,7 +937,6 @@ mod tests {
 
         encrypted.flush_all_pending(&mut writer).unwrap();
 
-<<<<<<< HEAD
         let packet_types = combined_packet_types(&encrypted, &mut writer);
         assert_eq!(
             packet_types
