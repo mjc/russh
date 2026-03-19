@@ -368,20 +368,34 @@ impl Encrypted {
         channel: ChannelId,
         writer: &mut PacketWriter,
     ) -> Result<usize, crate::Error> {
+        let mut pending_size = 0;
+        let mut maybe_flush_result = Option::<ChannelFlushResult>::None;
         let can_direct_write = self.can_direct_write();
-        let flush_result = match self.channels.get_mut(&channel) {
-            Some(ch) => Self::flush_channel(writer, &mut self.write, can_direct_write, ch)?,
-            None => return Ok(0),
-        };
-        let wrote = flush_result.wrote();
-        self.handle_flushed_channel(channel, flush_result)?;
-        Ok(wrote)
+
+        if let Some(channel) = self.channels.get_mut(&channel) {
+            let flush_result =
+                Self::flush_channel(writer, &mut self.write, can_direct_write, channel)?;
+            pending_size += flush_result.wrote();
+            maybe_flush_result = Some(flush_result);
+        }
+        if let Some(flush_result) = maybe_flush_result {
+            self.handle_flushed_channel(channel, flush_result)?;
+        }
+        Ok(pending_size)
     }
 
     pub fn flush_all_pending(&mut self, writer: &mut PacketWriter) -> Result<(), crate::Error> {
-        let channel_ids: Vec<ChannelId> = self.channels.keys().copied().collect();
-        for channel_id in channel_ids {
-            self.flush_pending(channel_id, writer)?;
+        let can_direct_write = self.can_direct_write();
+        let mut completed_channels = Vec::new();
+        for (&channel_id, channel) in &mut self.channels {
+            let flush_result =
+                Self::flush_channel(writer, &mut self.write, can_direct_write, channel)?;
+            if matches!(flush_result, ChannelFlushResult::Complete { .. }) {
+                completed_channels.push((channel_id, flush_result));
+            }
+        }
+        for (channel_id, flush_result) in completed_channels {
+            self.handle_flushed_channel(channel_id, flush_result)?;
         }
         Ok(())
     }
@@ -475,8 +489,6 @@ impl Encrypted {
             #[allow(clippy::indexing_slicing)] // length checked
             let chunk = &buf[..off];
             let recipient_channel = channel.recipient_channel;
-            // `packet` returns the plaintext payload — discard it; we only need
-            // the side-effect of writing the encrypted packet into writer's buffer.
             match a {
                 None => {
                     let _ = writer.packet(|write| {
@@ -861,7 +873,6 @@ mod tests {
         types.extend(packet_types(&encrypted.write));
         types
     }
-
     #[test]
     fn flush_all_pending_replays_deferred_eof_once() {
         let channel_id = ChannelId(1);
