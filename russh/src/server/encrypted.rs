@@ -670,7 +670,7 @@ impl Session {
                     }
                 }
                 if let Some(ref mut enc) = self.common.encrypted {
-                    enc.flush_pending(channel_num)?;
+                    enc.flush_pending(channel_num, &mut self.common.packet_writer)?;
                 }
                 if let Some(chan) = self.channels.get(&channel_num) {
                     chan.window_size().update(new_size).await;
