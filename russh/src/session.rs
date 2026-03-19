@@ -370,11 +370,14 @@ impl Encrypted {
     ) -> Result<usize, crate::Error> {
         let mut pending_size = 0;
         let mut maybe_flush_result = Option::<ChannelFlushResult>::None;
-        let can_direct_write = self.can_direct_write();
 
+        // Always use the staged path here: flush_pending is called from
+        // WINDOW_ADJUST handlers during normal operation where can_direct_write()
+        // may be true but direct-write would allocate a Vec per packet.
+        // Only flush_all_pending (called from newkeys) uses the direct path.
         if let Some(channel) = self.channels.get_mut(&channel) {
             let flush_result =
-                Self::flush_channel(writer, &mut self.write, can_direct_write, channel)?;
+                Self::flush_channel(writer, &mut self.write, false, channel)?;
             pending_size += flush_result.wrote();
             maybe_flush_result = Some(flush_result);
         }
@@ -946,11 +949,11 @@ mod tests {
     }
 
     #[test]
-    fn flush_pending_uses_staged_path_when_write_buffer_nonempty() {
-        // When enc.write already has data (can_direct_write == false),
-        // flush_channel must use data_noqueue_staged (appending to enc.write)
-        // rather than data_noqueue_direct, so the two output streams stay
-        // in order.
+    fn flush_pending_always_uses_staged_path() {
+        // flush_pending is called from WINDOW_ADJUST (normal operation), not
+        // from newkeys, so it must always use the staged path regardless of
+        // whether can_direct_write() is true.  Only flush_all_pending (rekey)
+        // may use the direct-write path.
         let channel_id = ChannelId(6);
         let mut encrypted = test_encrypted();
         let mut writer = PacketWriter::clear();
@@ -958,13 +961,10 @@ mod tests {
             .channels
             .insert(channel_id, test_channel(channel_id, 42, false, false));
 
-        // Simulate in-progress staged write so can_direct_write() returns false.
-        // Setting write_cursor non-zero is enough without corrupting enc.write.
-        encrypted.write_cursor = 1;
-
+        // write buffer is empty, so can_direct_write() would be true — but
+        // flush_pending must still stage into enc.write, not write via writer.
         encrypted.flush_pending(channel_id, &mut writer).unwrap();
 
-        // Pending data must have gone into enc.write (staged path), not writer.
         assert!(writer.buffer().buffer.is_empty());
         assert!(combined_packet_types(&encrypted, &mut writer).contains(&msg::CHANNEL_DATA));
     }
