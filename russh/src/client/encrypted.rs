@@ -854,12 +854,13 @@ impl Session {
                     accepted,
                     ref mut sent,
                 } => {
-                    debug!("sending ssh-userauth service request");
+                    debug!("sending ssh-userauth service requset");
                     if !*sent {
-                        push_packet!(enc.write, {
-                            msg::SERVICE_REQUEST.encode(&mut enc.write)?;
-                            "ssh-userauth".encode(&mut enc.write)?;
-                        });
+                        self.common.packet_writer.packet(|w| {
+                            msg::SERVICE_REQUEST.encode(w)?;
+                            "ssh-userauth".encode(w)?;
+                            Ok(())
+                        })?;
                         *sent = true
                     }
                     accepted
