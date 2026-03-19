@@ -930,6 +930,7 @@ mod tests {
         let eof_only = ChannelId(3);
         let close_too = ChannelId(4);
         let mut encrypted = test_encrypted();
+        let mut writer = PacketWriter::clear();
         encrypted
             .channels
             .insert(eof_only, test_channel(eof_only, 50, true, false));
@@ -937,7 +938,7 @@ mod tests {
             .channels
             .insert(close_too, test_channel(close_too, 51, true, true));
 
-        encrypted.flush_all_pending().unwrap();
+        encrypted.flush_all_pending(&mut writer).unwrap();
 
         // eof_only: data + EOF, channel still present
         assert!(encrypted.channels.contains_key(&eof_only));
@@ -947,7 +948,7 @@ mod tests {
         assert!(!encrypted.channels.contains_key(&close_too));
 
         // Combined wire output contains both sets of packets (order may vary by map iteration).
-        let types = packet_types(&encrypted.write);
+        let types = combined_packet_types(&encrypted, &mut writer);
         assert_eq!(types.iter().filter(|&&t| t == msg::CHANNEL_DATA).count(), 2);
         assert_eq!(types.iter().filter(|&&t| t == msg::CHANNEL_EOF).count(), 2);
         assert_eq!(
