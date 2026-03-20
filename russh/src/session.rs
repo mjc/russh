@@ -146,6 +146,24 @@ impl<C> CommonSession<C> {
         }
     }
 
+    /// Complete a rekey: install the new cipher, flush any pending channel
+    /// data with it, and record the rekey timestamp. No-op if not yet encrypted
+    /// (initial kex — caller handles that path separately).
+    pub fn rekey_flush(&mut self, newkeys: NewKeys) -> Result<(), crate::Error> {
+        if self.encrypted.is_none() {
+            return Ok(());
+        }
+        self.packet_writer.buffer().bytes = 0;
+        self.newkeys(newkeys);
+        // Second if-let: borrow checker requires releasing the `encrypted` borrow
+        // from is_none() before borrowing packet_writer in flush_all_pending.
+        if let Some(ref mut enc) = self.encrypted {
+            enc.last_rekey = std::time::Instant::now();
+            enc.flush_all_pending(&mut self.packet_writer)?;
+        }
+        Ok(())
+    }
+
     pub fn encrypted(&mut self, state: EncryptedState, newkeys: NewKeys) {
         let strict_kex = newkeys.names.strict_kex();
         self.encrypted = Some(Encrypted {
@@ -314,13 +332,18 @@ impl Encrypted {
         Ok(false)
     }
 
+    fn can_direct_write(&self) -> bool {
+        self.write_cursor == 0 && self.write.is_empty()
+    }
+
     fn flush_channel(
+        mut writer: Option<&mut PacketWriter>,
         write: &mut Vec<u8>,
         channel: &mut ChannelParams,
     ) -> Result<ChannelFlushResult, crate::Error> {
         let mut pending_size = 0;
         while let Some((buf, a, from)) = channel.pending_data.pop_front() {
-            let size = Self::data_noqueue(write, channel, &buf, a, from)?;
+            let size = Self::data_noqueue(writer.as_deref_mut(), write, channel, &buf, a, from)?;
             pending_size += size;
             if from + size < buf.len() {
                 channel.pending_data.push_front((buf, a, from + size));
@@ -355,7 +378,7 @@ impl Encrypted {
 
     pub fn flush_pending(&mut self, channel: ChannelId) -> Result<usize, crate::Error> {
         let flush_result = match self.channels.get_mut(&channel) {
-            Some(ch) => Self::flush_channel(&mut self.write, ch)?,
+            Some(ch) => Self::flush_channel(None, &mut self.write, ch)?,
             None => return Ok(0),
         };
         let wrote = flush_result.wrote();
@@ -363,10 +386,14 @@ impl Encrypted {
         Ok(wrote)
     }
 
-    pub fn flush_all_pending(&mut self) -> Result<(), crate::Error> {
-        let channel_ids: Vec<ChannelId> = self.channels.keys().copied().collect();
-        for channel_id in channel_ids {
-            self.flush_pending(channel_id)?;
+    pub fn flush_all_pending(&mut self, writer: &mut PacketWriter) -> Result<(), crate::Error> {
+        let can_direct = self.can_direct_write();
+        for channel_id in self.channels.keys().copied().collect::<Vec<_>>() {
+            let flush_result = match self.channels.get_mut(&channel_id) {
+                Some(ch) => Self::flush_channel(can_direct.then_some(&mut *writer), &mut self.write, ch)?,
+                None => continue, // channel removed between key collection and iteration; skip
+            };
+            self.handle_flushed_channel(channel_id, flush_result)?;
         }
         Ok(())
     }
@@ -386,9 +413,11 @@ impl Encrypted {
     }
 
     /// Push the largest amount of `&buf0[from..]` that can fit into
-    /// the window, dividing it into packets if it is too large, and
-    /// return the length that was written.
+    /// the window, dividing it into packets, and return the length written.
+    /// If `writer` is `Some`, packets are written directly via `PacketWriter`
+    /// (post-rekey flush); otherwise they are staged into `write`.
     fn data_noqueue(
+        mut writer: Option<&mut PacketWriter>,
         write: &mut Vec<u8>,
         channel: &mut ChannelParams,
         buf0: &[u8],
@@ -406,37 +435,46 @@ impl Encrypted {
             &buf0[from..]
         };
         let buf_len = buf.len();
-
         while !buf.is_empty() {
-            // Compute the length we're allowed to send.
-            let off = std::cmp::min(buf.len(), channel.recipient_maximum_packet_size as usize);
-            match a {
-                None => push_packet!(write, {
-                    write.push(msg::CHANNEL_DATA);
-                    channel.recipient_channel.encode(write)?;
-                    #[allow(clippy::indexing_slicing)] // length checked
-                    buf[..off].encode(write)?;
-                }),
-                Some(ext) => push_packet!(write, {
-                    write.push(msg::CHANNEL_EXTENDED_DATA);
-                    channel.recipient_channel.encode(write)?;
-                    ext.encode(write)?;
-                    #[allow(clippy::indexing_slicing)] // length checked
-                    buf[..off].encode(write)?;
-                }),
+            let off = buf.len().min(channel.recipient_maximum_packet_size as usize);
+            #[allow(clippy::indexing_slicing)] // length checked
+            let chunk = &buf[..off];
+            let rc = channel.recipient_channel;
+            match writer.as_deref_mut() {
+                Some(w) => {
+                    let _ = w.packet(|pw| {
+                        match a {
+                            None => msg::CHANNEL_DATA.encode(pw)?,
+                            Some(e) => {
+                                msg::CHANNEL_EXTENDED_DATA.encode(pw)?;
+                                e.encode(pw)?;
+                            }
+                        }
+                        rc.encode(pw)?;
+                        chunk.encode(pw)?;
+                        Ok(())
+                    })?;
+                }
+                None => match a {
+                    None => push_packet!(write, {
+                        write.push(msg::CHANNEL_DATA);
+                        rc.encode(write)?;
+                        chunk.encode(write)?;
+                    }),
+                    Some(ext) => push_packet!(write, {
+                        write.push(msg::CHANNEL_EXTENDED_DATA);
+                        rc.encode(write)?;
+                        ext.encode(write)?;
+                        chunk.encode(write)?;
+                    }),
+                },
             }
-            trace!(
-                "buffer: {:?} {:?}",
-                write.len(),
-                channel.recipient_window_size
-            );
             channel.recipient_window_size -= off as u32;
             #[allow(clippy::indexing_slicing)] // length checked
             {
                 buf = &buf[off..]
             }
         }
-        trace!("buf.len() = {:?}, buf_len = {:?}", buf.len(), buf_len);
         Ok(buf_len)
     }
 
@@ -449,11 +487,11 @@ impl Encrypted {
         let buf0 = buf0.into();
         if let Some(channel) = self.channels.get_mut(&channel) {
             assert!(channel.confirmed);
-            if !channel.pending_data.is_empty() && is_rekeying {
+            if !channel.pending_data.is_empty() || is_rekeying {
                 channel.pending_data.push_back((buf0, None, 0));
                 return Ok(());
             }
-            let buf_len = Self::data_noqueue(&mut self.write, channel, &buf0, None, 0)?;
+            let buf_len = Self::data_noqueue(None, &mut self.write, channel, &buf0, None, 0)?;
             if buf_len < buf0.len() {
                 channel.pending_data.push_back((buf0, None, buf_len))
             }
@@ -473,11 +511,11 @@ impl Encrypted {
         let buf0 = buf0.into();
         if let Some(channel) = self.channels.get_mut(&channel) {
             assert!(channel.confirmed);
-            if !channel.pending_data.is_empty() && is_rekeying {
+            if !channel.pending_data.is_empty() || is_rekeying {
                 channel.pending_data.push_back((buf0, Some(ext), 0));
                 return Ok(());
             }
-            let buf_len = Self::data_noqueue(&mut self.write, channel, &buf0, Some(ext), 0)?;
+            let buf_len = Self::data_noqueue(None, &mut self.write, channel, &buf0, Some(ext), 0)?;
             if buf_len < buf0.len() {
                 channel.pending_data.push_back((buf0, Some(ext), buf_len))
             }
@@ -626,6 +664,7 @@ mod tests {
     use super::{Encrypted, EncryptedState, Exchange};
     use crate::compression::{Compression, Decompress};
     use crate::kex::{KEXES, NONE};
+    use crate::sshbuffer::PacketWriter;
     use crate::{ChannelId, ChannelParams, CryptoVec, mac, msg};
 
     fn test_encrypted() -> Encrypted {
@@ -768,24 +807,43 @@ mod tests {
 
     // flush_all_pending (multi-channel path)
 
+    fn output_packet_types(buf: &[u8]) -> Vec<u8> {
+        let mut packet_types = Vec::new();
+        let mut cursor = 0;
+
+        while cursor < buf.len() {
+            let packet_len = BigEndian::read_u32(&buf[cursor..cursor + 4]) as usize;
+            packet_types.push(buf[cursor + 5]);
+            cursor += 4 + packet_len;
+        }
+
+        packet_types
+    }
+
+    fn combined_packet_types(encrypted: &Encrypted, writer: &mut PacketWriter) -> Vec<u8> {
+        let mut types = output_packet_types(&writer.buffer().buffer);
+        types.extend(packet_types(&encrypted.write));
+        types
+    }
     #[test]
     fn flush_all_pending_replays_deferred_eof_once() {
         let channel_id = ChannelId(1);
         let mut encrypted = test_encrypted();
+        let mut writer = PacketWriter::clear();
         encrypted
             .channels
             .insert(channel_id, test_channel(channel_id, 42, true, false));
 
-        encrypted.flush_all_pending().unwrap();
+        encrypted.flush_all_pending(&mut writer).unwrap();
         assert_eq!(
-            packet_types(&encrypted.write),
+            combined_packet_types(&encrypted, &mut writer),
             vec![msg::CHANNEL_DATA, msg::CHANNEL_EOF]
         );
         assert!(!encrypted.channels[&channel_id].pending_eof);
 
-        encrypted.flush_all_pending().unwrap();
+        encrypted.flush_all_pending(&mut writer).unwrap();
         assert_eq!(
-            packet_types(&encrypted.write),
+            combined_packet_types(&encrypted, &mut writer),
             vec![msg::CHANNEL_DATA, msg::CHANNEL_EOF]
         );
     }
@@ -794,13 +852,14 @@ mod tests {
     fn flush_all_pending_replays_deferred_close_and_removes_channel() {
         let channel_id = ChannelId(2);
         let mut encrypted = test_encrypted();
+        let mut writer = PacketWriter::clear();
         encrypted
             .channels
             .insert(channel_id, test_channel(channel_id, 43, true, true));
 
-        encrypted.flush_all_pending().unwrap();
+        encrypted.flush_all_pending(&mut writer).unwrap();
         assert_eq!(
-            packet_types(&encrypted.write),
+            combined_packet_types(&encrypted, &mut writer),
             vec![msg::CHANNEL_DATA, msg::CHANNEL_EOF, msg::CHANNEL_CLOSE]
         );
         assert!(!encrypted.channels.contains_key(&channel_id));
@@ -811,6 +870,7 @@ mod tests {
         let eof_only = ChannelId(3);
         let close_too = ChannelId(4);
         let mut encrypted = test_encrypted();
+        let mut writer = PacketWriter::clear();
         encrypted
             .channels
             .insert(eof_only, test_channel(eof_only, 50, true, false));
@@ -818,7 +878,7 @@ mod tests {
             .channels
             .insert(close_too, test_channel(close_too, 51, true, true));
 
-        encrypted.flush_all_pending().unwrap();
+        encrypted.flush_all_pending(&mut writer).unwrap();
 
         // eof_only: data + EOF, channel still present
         assert!(encrypted.channels.contains_key(&eof_only));
@@ -828,12 +888,59 @@ mod tests {
         assert!(!encrypted.channels.contains_key(&close_too));
 
         // Combined wire output contains both sets of packets (order may vary by map iteration).
-        let types = packet_types(&encrypted.write);
+        let types = combined_packet_types(&encrypted, &mut writer);
         assert_eq!(types.iter().filter(|&&t| t == msg::CHANNEL_DATA).count(), 2);
         assert_eq!(types.iter().filter(|&&t| t == msg::CHANNEL_EOF).count(), 2);
         assert_eq!(
             types.iter().filter(|&&t| t == msg::CHANNEL_CLOSE).count(),
             1
         );
+    }
+
+    #[test]
+    fn flush_pending_always_uses_staged_path() {
+        // flush_pending is called from WINDOW_ADJUST (normal operation), not
+        // from newkeys, so it must always use the staged path regardless of
+        // whether can_direct_write() is true.  Only flush_all_pending (rekey)
+        // may use the direct-write path.
+        let channel_id = ChannelId(6);
+        let mut encrypted = test_encrypted();
+        let mut writer = PacketWriter::clear();
+        encrypted
+            .channels
+            .insert(channel_id, test_channel(channel_id, 42, false, false));
+
+        // write buffer is empty, so can_direct_write() would be true — but
+        // flush_pending must still stage into enc.write, not write via writer.
+        encrypted.flush_pending(channel_id).unwrap();
+
+        assert!(writer.buffer().buffer.is_empty());
+        assert!(packet_types(&encrypted.write).contains(&msg::CHANNEL_DATA));
+    }
+
+    #[test]
+    fn data_queues_behind_existing_pending_data_when_not_rekeying() {
+        // If pending_data is non-empty, new data must be queued rather than
+        // sent immediately, even when not rekeying, to preserve ordering.
+        let channel_id = ChannelId(5);
+        let mut encrypted = test_encrypted();
+        let mut writer = PacketWriter::clear();
+        encrypted
+            .channels
+            .insert(channel_id, test_channel(channel_id, 42, false, false));
+
+        let initial_pending = encrypted.channels[&channel_id].pending_data.len();
+        encrypted
+            .data(channel_id, bytes::Bytes::from_static(b"new"), false)
+            .unwrap();
+
+        // New data must be appended to pending_data, not sent immediately.
+        assert_eq!(
+            encrypted.channels[&channel_id].pending_data.len(),
+            initial_pending + 1
+        );
+        // Nothing written to wire.
+        assert!(writer.buffer().buffer.is_empty());
+        assert!(encrypted.write.is_empty());
     }
 }
