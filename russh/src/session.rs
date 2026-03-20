@@ -155,6 +155,8 @@ impl<C> CommonSession<C> {
         }
         self.packet_writer.buffer().bytes = 0;
         self.newkeys(newkeys);
+        // Second if-let: borrow checker requires releasing the `encrypted` borrow
+        // from is_none() before borrowing packet_writer in flush_all_pending.
         if let Some(ref mut enc) = self.encrypted {
             enc.last_rekey = std::time::Instant::now();
             enc.flush_all_pending(&mut self.packet_writer)?;
@@ -389,7 +391,7 @@ impl Encrypted {
         for channel_id in self.channels.keys().copied().collect::<Vec<_>>() {
             let flush_result = match self.channels.get_mut(&channel_id) {
                 Some(ch) => Self::flush_channel(can_direct.then_some(&mut *writer), &mut self.write, ch)?,
-                None => continue,
+                None => continue, // channel removed between key collection and iteration; skip
             };
             self.handle_flushed_channel(channel_id, flush_result)?;
         }
@@ -913,7 +915,7 @@ mod tests {
         encrypted.flush_pending(channel_id).unwrap();
 
         assert!(writer.buffer().buffer.is_empty());
-        assert!(combined_packet_types(&encrypted, &mut writer).contains(&msg::CHANNEL_DATA));
+        assert!(packet_types(&encrypted.write).contains(&msg::CHANNEL_DATA));
     }
 
     #[test]
