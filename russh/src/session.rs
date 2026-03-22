@@ -158,7 +158,7 @@ impl<C> CommonSession<C> {
         // Second if-let: borrow checker requires releasing the `encrypted` borrow
         // from is_none() before borrowing packet_writer in flush_all_pending.
         if let Some(ref mut enc) = self.encrypted {
-            enc.last_rekey = std::time::Instant::now();
+            enc.last_rekey = russh_util::time::Instant::now();
             enc.flush_all_pending(&mut self.packet_writer)?;
         }
         Ok(())
@@ -444,13 +444,16 @@ impl Encrypted {
                 Some(w) => {
                     let _ = w.packet(|pw| {
                         match a {
-                            None => msg::CHANNEL_DATA.encode(pw)?,
+                            None => {
+                                msg::CHANNEL_DATA.encode(pw)?;
+                                rc.encode(pw)?;
+                            }
                             Some(e) => {
                                 msg::CHANNEL_EXTENDED_DATA.encode(pw)?;
+                                rc.encode(pw)?;
                                 e.encode(pw)?;
                             }
                         }
-                        rc.encode(pw)?;
                         chunk.encode(pw)?;
                         Ok(())
                     })?;
