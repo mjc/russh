@@ -1538,18 +1538,15 @@ async fn reply<H: Handler>(
                         .kex_done(shared_secret, &newkeys.names, session)
                         .await?;
 
-                    if let Some(ref mut enc) = session.common.encrypted {
+                    if session.common.encrypted.is_some() {
                         // This is a rekey
-                        enc.last_rekey = Instant::now();
-                        session.common.packet_writer.buffer().bytes = 0;
-                        enc.flush_all_pending()?;
+                        session.common.rekey_flush(newkeys)?;
                         let mut pending = std::mem::take(&mut session.pending_reads);
                         for p in pending.drain(..) {
                             session.process_packet(handler, &p).await?;
                         }
                         session.pending_reads = pending;
                         session.pending_len = 0;
-                        session.common.newkeys(newkeys);
                     } else {
                         // This is the initial kex
                         if let Some(server_host_key) = &server_host_key {
