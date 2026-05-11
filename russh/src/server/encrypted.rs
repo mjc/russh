@@ -936,6 +936,7 @@ impl Session {
                         handler.shell_request(channel_num, self).await
                     }
                     "auth-agent-req@openssh.com" => {
+                        ensure_end(r)?;
                         if let Some(chan) = self.channels.get(&channel_num) {
                             let _ = chan
                                 .send(ChannelMsg::AgentForward { want_reply: true })
