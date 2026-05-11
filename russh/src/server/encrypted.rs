@@ -907,6 +907,7 @@ impl Session {
                     "env" => {
                         let env_variable = map_err!(String::decode(r))?;
                         let env_value = map_err!(String::decode(r))?;
+                        ensure_end(r)?;
 
                         if let Some(chan) = self.channels.get(&channel_num) {
                             let _ = chan

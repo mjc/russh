@@ -139,6 +139,29 @@ async fn malformed_pty_req_trailing_bytes_rejected_by_server() {
 }
 
 #[tokio::test]
+async fn env_request_with_trailing_bytes_rejected_by_server() {
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        raw_pty_req_signal(|server_channel| {
+            let mut payload = channel_request_payload(server_channel, b"env");
+            encode_string(&mut payload, b"LANG");
+            encode_string(&mut payload, b"C");
+            payload.push(0);
+            payload
+        }),
+    )
+    .await;
+
+    assert!(
+        matches!(
+            result,
+            Ok(ServerSignal::Closed | ServerSignal::ProtocolError(_))
+        ),
+        "server accepted an env request with trailing bytes: {result:?}"
+    );
+}
+
+#[tokio::test]
 async fn keyboard_interactive_rejects_excessive_prompt_count() {
     let result = tokio::time::timeout(
         Duration::from_secs(3),
@@ -712,17 +735,22 @@ async fn raw_open_session(stream: &mut tokio::net::TcpStream) -> io::Result<u32>
 }
 
 fn pty_req_payload(server_channel: u32, terminal_modes: &[u8]) -> Vec<u8> {
-    let mut payload = Vec::new();
-    payload.push(MSG_CHANNEL_REQUEST);
-    push_u32(&mut payload, server_channel);
-    encode_string(&mut payload, b"pty-req");
-    payload.push(1);
+    let mut payload = channel_request_payload(server_channel, b"pty-req");
     encode_string(&mut payload, b"xterm");
     push_u32(&mut payload, 80);
     push_u32(&mut payload, 24);
     push_u32(&mut payload, 0);
     push_u32(&mut payload, 0);
     encode_string(&mut payload, terminal_modes);
+    payload
+}
+
+fn channel_request_payload(server_channel: u32, request_type: &[u8]) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.push(MSG_CHANNEL_REQUEST);
+    push_u32(&mut payload, server_channel);
+    encode_string(&mut payload, request_type);
+    payload.push(1);
     payload
 }
 
