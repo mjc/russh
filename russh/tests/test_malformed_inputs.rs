@@ -1,0 +1,359 @@
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+//! Regression tests for malformed SSH inputs.
+
+use std::borrow::Cow;
+use std::io;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
+
+use byteorder::{BigEndian, ByteOrder};
+use russh::{Channel, ChannelId, Pty, cipher, compression, kex, mac, server};
+use ssh_key::{Algorithm, PrivateKey};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+const MSG_SERVICE_REQUEST: u8 = 5;
+const MSG_SERVICE_ACCEPT: u8 = 6;
+const MSG_KEXINIT: u8 = 20;
+const MSG_NEWKEYS: u8 = 21;
+const MSG_USERAUTH_REQUEST: u8 = 50;
+const MSG_USERAUTH_SUCCESS: u8 = 52;
+const MSG_CHANNEL_OPEN: u8 = 90;
+const MSG_CHANNEL_OPEN_CONFIRMATION: u8 = 91;
+const MSG_CHANNEL_REQUEST: u8 = 98;
+
+#[tokio::test]
+async fn malformed_pty_req_truncated_modes_rejected_by_server() {
+    let (signal, panicked) = capture_panics(async {
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            raw_pty_req_signal(|server_channel| {
+                pty_req_payload(server_channel, &[Pty::VINTR as u8, 0, 0, 0])
+            }),
+        )
+        .await
+    })
+    .await;
+
+    assert!(!panicked, "truncated pty modes caused an internal panic");
+    assert!(
+        matches!(
+            &signal,
+            Ok(ServerSignal::Closed | ServerSignal::ProtocolError(_))
+        ),
+        "truncated pty modes panicked or hung at the parser: {signal:?}"
+    );
+    assert_not_task_panic(signal);
+}
+
+#[tokio::test]
+async fn malformed_pty_req_too_many_modes_does_not_crash_server() {
+    let (signal, panicked) = capture_panics(async {
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            raw_pty_req_signal(|server_channel| {
+                let mut modes = Vec::with_capacity(5 * 131 + 1);
+                for value in 0..131u32 {
+                    modes.push(Pty::VINTR as u8);
+                    modes.extend_from_slice(&value.to_be_bytes());
+                }
+                modes.push(Pty::TTY_OP_END as u8);
+                pty_req_payload(server_channel, &modes)
+            }),
+        )
+        .await
+    })
+    .await;
+
+    assert!(!panicked, "oversized pty modes caused an internal panic");
+    assert!(
+        matches!(
+            &signal,
+            Ok(ServerSignal::Closed | ServerSignal::ProtocolError(_) | ServerSignal::Survived)
+        ),
+        "oversized pty modes panicked or hung at the parser: {signal:?}"
+    );
+    assert_not_task_panic(signal);
+}
+
+#[tokio::test]
+async fn malformed_pty_req_rejects_bytes_after_mode_end() {
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        raw_pty_req_signal(|server_channel| {
+            pty_req_payload(server_channel, &[Pty::TTY_OP_END as u8, 0])
+        }),
+    )
+    .await;
+
+    assert!(
+        matches!(
+            result,
+            Ok(ServerSignal::Closed | ServerSignal::ProtocolError(_))
+        ),
+        "server accepted trailing bytes inside pty terminal modes: {result:?}"
+    );
+}
+
+#[derive(Debug)]
+enum ServerSignal {
+    Closed,
+    ProtocolError(String),
+    Panicked,
+    Survived,
+}
+
+fn assert_not_task_panic(signal: Result<ServerSignal, tokio::time::error::Elapsed>) {
+    match signal {
+        Ok(ServerSignal::ProtocolError(error)) => {
+            assert_ne!(error, "JoinError", "server task panicked")
+        }
+        Ok(ServerSignal::Panicked) => panic!("server task panicked"),
+        Ok(ServerSignal::Closed | ServerSignal::Survived) => {}
+        Err(error) => panic!("server task hung: {error}"),
+    }
+}
+
+async fn capture_panics<T>(future: impl std::future::Future<Output = T>) -> (T, bool) {
+    static PANIC_HOOK_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    let _guard = PANIC_HOOK_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let panicked = Arc::new(AtomicBool::new(false));
+    let panicked_hook = panicked.clone();
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |_| {
+        panicked_hook.store(true, Ordering::SeqCst);
+    }));
+
+    let result = future.await;
+
+    std::panic::set_hook(previous_hook);
+    (result, panicked.load(Ordering::SeqCst))
+}
+
+async fn raw_pty_req_signal(build_payload: impl FnOnce(u32) -> Vec<u8>) -> ServerSignal {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let mut server_task = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let running = server::run_stream(no_crypto_server_config(), socket, MalformedInputServer)
+            .await
+            .unwrap();
+        running.await
+    });
+
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    raw_client_no_crypto_handshake(&mut stream).await.unwrap();
+    raw_auth_none(&mut stream).await.unwrap();
+    let server_channel = raw_open_session(&mut stream).await.unwrap();
+    stream
+        .write_all(&ssh_packet(&build_payload(server_channel)))
+        .await
+        .unwrap();
+    stream.flush().await.unwrap();
+
+    match tokio::time::timeout(Duration::from_millis(200), &mut server_task).await {
+        Ok(Ok(Ok(()))) => ServerSignal::Closed,
+        Ok(Ok(Err(error))) => ServerSignal::ProtocolError(error.to_string()),
+        Ok(Err(join)) if join.is_panic() => ServerSignal::Panicked,
+        Err(_) => {
+            server_task.abort();
+            ServerSignal::Survived
+        }
+        _ => ServerSignal::Closed,
+    }
+}
+
+fn no_crypto_server_config() -> Arc<server::Config> {
+    let mut config = server::Config::default();
+    config.inactivity_timeout = None;
+    config.auth_rejection_time = Duration::from_millis(1);
+    config.auth_rejection_time_initial = Some(Duration::from_millis(1));
+    config.preferred = no_crypto_preferred();
+    config
+        .keys
+        .push(PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap());
+    Arc::new(config)
+}
+
+fn no_crypto_preferred() -> russh::Preferred {
+    russh::Preferred {
+        kex: Cow::Owned(vec![kex::NONE]),
+        key: Cow::Owned(vec![Algorithm::Ed25519]),
+        cipher: Cow::Owned(vec![cipher::NONE]),
+        mac: Cow::Owned(vec![mac::NONE]),
+        compression: Cow::Owned(vec![compression::NONE]),
+    }
+}
+
+async fn raw_client_no_crypto_handshake(stream: &mut tokio::net::TcpStream) -> io::Result<()> {
+    stream.write_all(b"SSH-2.0-russh-test\r\n").await?;
+    read_ssh_id(stream).await?;
+    let _server_kex = read_packet(stream).await?;
+    stream
+        .write_all(&ssh_packet(&kexinit_payload("none")))
+        .await?;
+    let newkeys = read_packet(stream).await?;
+    assert_eq!(newkeys.first(), Some(&MSG_NEWKEYS));
+    stream.write_all(&ssh_packet(&[MSG_NEWKEYS])).await?;
+    stream.flush().await
+}
+
+async fn raw_auth_none(stream: &mut tokio::net::TcpStream) -> io::Result<()> {
+    let mut service = Vec::new();
+    service.push(MSG_SERVICE_REQUEST);
+    encode_string(&mut service, b"ssh-userauth");
+    stream.write_all(&ssh_packet(&service)).await?;
+
+    let accept = read_packet(stream).await?;
+    assert_eq!(accept.first(), Some(&MSG_SERVICE_ACCEPT));
+
+    let mut auth = Vec::new();
+    auth.push(MSG_USERAUTH_REQUEST);
+    encode_string(&mut auth, b"test");
+    encode_string(&mut auth, b"ssh-connection");
+    encode_string(&mut auth, b"none");
+    stream.write_all(&ssh_packet(&auth)).await?;
+
+    let success = read_packet(stream).await?;
+    assert_eq!(success.first(), Some(&MSG_USERAUTH_SUCCESS));
+    Ok(())
+}
+
+async fn raw_open_session(stream: &mut tokio::net::TcpStream) -> io::Result<u32> {
+    let mut open = Vec::new();
+    open.push(MSG_CHANNEL_OPEN);
+    encode_string(&mut open, b"session");
+    push_u32(&mut open, 0);
+    push_u32(&mut open, 1024 * 1024);
+    push_u32(&mut open, 32 * 1024);
+    stream.write_all(&ssh_packet(&open)).await?;
+
+    let confirmation = read_packet(stream).await?;
+    assert_eq!(confirmation.first(), Some(&MSG_CHANNEL_OPEN_CONFIRMATION));
+    Ok(BigEndian::read_u32(&confirmation[5..9]))
+}
+
+fn pty_req_payload(server_channel: u32, terminal_modes: &[u8]) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.push(MSG_CHANNEL_REQUEST);
+    push_u32(&mut payload, server_channel);
+    encode_string(&mut payload, b"pty-req");
+    payload.push(1);
+    encode_string(&mut payload, b"xterm");
+    push_u32(&mut payload, 80);
+    push_u32(&mut payload, 24);
+    push_u32(&mut payload, 0);
+    push_u32(&mut payload, 0);
+    encode_string(&mut payload, terminal_modes);
+    payload
+}
+
+fn kexinit_payload(kex_name: &str) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.push(MSG_KEXINIT);
+    payload.extend_from_slice(&[0; 16]);
+    encode_name_list(&mut payload, &[kex_name]);
+    encode_name_list(&mut payload, &["ssh-ed25519"]);
+    encode_name_list(&mut payload, &["none"]);
+    encode_name_list(&mut payload, &["none"]);
+    encode_name_list(&mut payload, &["none"]);
+    encode_name_list(&mut payload, &["none"]);
+    encode_name_list(&mut payload, &["none"]);
+    encode_name_list(&mut payload, &["none"]);
+    encode_name_list(&mut payload, &[]);
+    encode_name_list(&mut payload, &[]);
+    payload.push(0);
+    push_u32(&mut payload, 0);
+    payload
+}
+
+fn ssh_packet(payload: &[u8]) -> Vec<u8> {
+    let mut padding_len = 8 - ((5 + payload.len()) % 8);
+    if padding_len < 4 {
+        padding_len += 8;
+    }
+    let packet_len = 1 + payload.len() + padding_len;
+    let mut packet = Vec::with_capacity(4 + packet_len);
+    push_u32(&mut packet, packet_len as u32);
+    packet.push(padding_len as u8);
+    packet.extend_from_slice(payload);
+    packet.resize(packet.len() + padding_len, 0);
+    packet
+}
+
+async fn read_packet(stream: &mut tokio::net::TcpStream) -> io::Result<Vec<u8>> {
+    let mut len_buf = [0; 4];
+    stream.read_exact(&mut len_buf).await?;
+    let packet_len = BigEndian::read_u32(&len_buf) as usize;
+    let mut packet = vec![0; packet_len];
+    stream.read_exact(&mut packet).await?;
+    let padding_len = packet[0] as usize;
+    Ok(packet[1..packet.len() - padding_len].to_vec())
+}
+
+async fn read_ssh_id(stream: &mut tokio::net::TcpStream) -> io::Result<Vec<u8>> {
+    let mut id = Vec::new();
+    loop {
+        let mut byte = [0];
+        stream.read_exact(&mut byte).await?;
+        id.push(byte[0]);
+        if byte[0] == b'\n' {
+            return Ok(id);
+        }
+    }
+}
+
+fn encode_name_list(buf: &mut Vec<u8>, names: &[&str]) {
+    encode_string(buf, names.join(",").as_bytes());
+}
+
+fn encode_string(buf: &mut Vec<u8>, value: &[u8]) {
+    push_u32(buf, value.len() as u32);
+    buf.extend_from_slice(value);
+}
+
+fn push_u32(buf: &mut Vec<u8>, value: u32) {
+    let mut bytes = [0; 4];
+    BigEndian::write_u32(&mut bytes, value);
+    buf.extend_from_slice(&bytes);
+}
+
+#[derive(Clone)]
+struct MalformedInputServer;
+
+impl server::Handler for MalformedInputServer {
+    type Error = russh::Error;
+
+    async fn auth_none(&mut self, _user: &str) -> Result<server::Auth, Self::Error> {
+        Ok(server::Auth::Accept)
+    }
+
+    async fn channel_open_session(
+        &mut self,
+        _channel: Channel<server::Msg>,
+        _session: &mut server::Session,
+    ) -> Result<bool, Self::Error> {
+        Ok(true)
+    }
+
+    async fn pty_request(
+        &mut self,
+        _channel: ChannelId,
+        _term: &str,
+        _col_width: u32,
+        _row_height: u32,
+        _pix_width: u32,
+        _pix_height: u32,
+        _modes: &[(Pty, u32)],
+        _session: &mut server::Session,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}

@@ -750,29 +750,34 @@ impl Session {
                         let pix_width = map_err!(u32::decode(r))?;
                         let pix_height = map_err!(u32::decode(r))?;
                         let mut modes = [(Pty::TTY_OP_END, 0); 130];
-                        let mut i = 0;
+                        let mut modes_len = 0;
                         {
                             let mode_string = map_err!(Bytes::decode(r))?;
-                            while 5 * i < mode_string.len() {
-                                #[allow(clippy::indexing_slicing)] // length checked
-                                let code = mode_string[5 * i];
+                            let mut mode_string = mode_string.as_ref();
+                            while let Some((&code, rest)) = mode_string.split_first() {
                                 if code == 0 {
+                                    if !rest.is_empty() {
+                                        return Err(Error::Inconsistent.into());
+                                    }
                                     break;
                                 }
-                                #[allow(clippy::indexing_slicing)] // length checked
-                                let num = BigEndian::read_u32(&mode_string[5 * i + 1..]);
+                                if rest.len() < 4 {
+                                    return Err(Error::Inconsistent.into());
+                                }
+                                let (num_bytes, remaining) = rest.split_at(4);
+                                let num = BigEndian::read_u32(num_bytes);
                                 debug!("code = {code:?}");
                                 if let Some(code) = Pty::from_u8(code) {
-                                    #[allow(clippy::indexing_slicing)] // length checked
-                                    if i < 130 {
-                                        modes[i] = (code, num);
+                                    if let Some(mode) = modes.get_mut(modes_len) {
+                                        *mode = (code, num);
+                                        modes_len += 1;
                                     } else {
                                         error!("pty-req: too many pty codes");
                                     }
                                 } else {
                                     info!("pty-req: unknown pty code {code:?}");
                                 }
-                                i += 1
+                                mode_string = remaining;
                             }
                         }
 
@@ -791,7 +796,7 @@ impl Session {
                         }
 
                         debug!("handler.pty_request {channel_num:?}");
-                        #[allow(clippy::indexing_slicing)] // `modes` length checked
+                        let modes = modes.get(..modes_len).ok_or(Error::Inconsistent)?;
                         handler
                             .pty_request(
                                 channel_num,
@@ -800,7 +805,7 @@ impl Session {
                                 row_height,
                                 pix_width,
                                 pix_height,
-                                &modes[0..i],
+                                modes,
                                 self,
                             )
                             .await
