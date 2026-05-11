@@ -272,6 +272,9 @@ pub(crate) async fn read<R: AsyncRead + Unpin>(
             if len > MAXIMUM_PACKET_LEN {
                 return Err(Error::PacketSize(len));
             }
+            if len < PADDING_LENGTH_LEN + PACKET_LENGTH_LEN {
+                return Err(Error::PacketSize(len));
+            }
 
             buffer.len = len + cipher.tag_len();
             trace!("reading, clear len = {:?}", buffer.len);
@@ -292,6 +295,12 @@ pub(crate) async fn read<R: AsyncRead + Unpin>(
 
     let padding_length = *plaintext.first().to_owned().unwrap_or(&0) as usize;
     trace!("reading, padding_length {padding_length:?}");
+    if padding_length < PACKET_LENGTH_LEN {
+        return Err(Error::PacketSize(padding_length));
+    }
+    if padding_length + PADDING_LENGTH_LEN >= plaintext.len() {
+        return Err(Error::PacketSize(padding_length));
+    }
     let plaintext_end = plaintext
         .len()
         .checked_sub(padding_length)
@@ -326,3 +335,72 @@ pub(crate) const MAXIMUM_PACKET_LEN: usize =
 
 #[cfg(feature = "_bench")]
 pub mod benchmark;
+
+#[cfg(test)]
+mod tests {
+    use byteorder::{BigEndian, ByteOrder};
+    use tokio::io::AsyncWriteExt;
+
+    use super::{MAXIMUM_PACKET_LEN, read};
+    use crate::Error;
+    use crate::cipher::clear;
+    use crate::sshbuffer::SSHBuffer;
+
+    fn packet(packet_len: usize, padding_len: u8, payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut len = [0; 4];
+        BigEndian::write_u32(&mut len, packet_len as u32);
+        out.extend_from_slice(&len);
+        out.push(padding_len);
+        out.extend_from_slice(payload);
+        out.resize(4 + packet_len, 0);
+        out
+    }
+
+    async fn read_clear(packet: Vec<u8>) -> Result<usize, Error> {
+        let (mut tx, mut rx) = tokio::io::duplex(packet.len().max(1));
+        tx.write_all(&packet).await.unwrap();
+        tx.shutdown().await.unwrap();
+
+        let mut buffer = SSHBuffer::new();
+        let mut key = clear::Key {};
+        read(&mut rx, &mut buffer, &mut key).await
+    }
+
+    #[tokio::test]
+    async fn read_rejects_too_short_packet_length_before_body_read() {
+        assert!(matches!(
+            read_clear(packet(4, 4, &[])).await,
+            Err(Error::PacketSize(4))
+        ));
+    }
+
+    #[tokio::test]
+    async fn read_rejects_padding_shorter_than_minimum() {
+        assert!(matches!(
+            read_clear(packet(8, 3, &[0, 0, 0, 0])).await,
+            Err(Error::PacketSize(3))
+        ));
+    }
+
+    #[tokio::test]
+    async fn read_rejects_all_padding_body() {
+        assert!(matches!(
+            read_clear(packet(5, 4, &[])).await,
+            Err(Error::PacketSize(4))
+        ));
+    }
+
+    #[tokio::test]
+    async fn read_rejects_one_byte_over_max_packet_before_body_read() {
+        let mut packet = Vec::new();
+        let mut len = [0; 4];
+        BigEndian::write_u32(&mut len, (MAXIMUM_PACKET_LEN + 1) as u32);
+        packet.extend_from_slice(&len);
+
+        assert!(matches!(
+            read_clear(packet).await,
+            Err(Error::PacketSize(size)) if size == MAXIMUM_PACKET_LEN + 1
+        ));
+    }
+}
