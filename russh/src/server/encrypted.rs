@@ -880,6 +880,7 @@ impl Session {
                         let x11_auth_protocol = map_err!(String::decode(r))?;
                         let x11_auth_cookie = map_err!(String::decode(r))?;
                         let x11_screen_number = map_err!(u32::decode(r))?;
+                        ensure_end(r)?;
 
                         if let Some(chan) = self.channels.get(&channel_num) {
                             let _ = chan
