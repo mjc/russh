@@ -227,6 +227,28 @@ async fn shell_request_with_trailing_bytes_rejected_by_server() {
 }
 
 #[tokio::test]
+async fn signal_request_with_trailing_bytes_rejected_by_server() {
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        raw_pty_req_signal(|server_channel| {
+            let mut payload = channel_request_payload(server_channel, b"signal");
+            encode_string(&mut payload, b"TERM");
+            payload.push(0);
+            payload
+        }),
+    )
+    .await;
+
+    assert!(
+        matches!(
+            result,
+            Ok(ServerSignal::Closed | ServerSignal::ProtocolError(_))
+        ),
+        "server accepted a signal request with trailing bytes: {result:?}"
+    );
+}
+
+#[tokio::test]
 async fn keyboard_interactive_rejects_excessive_prompt_count() {
     let result = tokio::time::timeout(
         Duration::from_secs(3),

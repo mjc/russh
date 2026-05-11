@@ -1010,6 +1010,7 @@ impl Session {
                     }
                     "signal" => {
                         let signal = Sig::from_name(&map_err!(String::decode(r))?);
+                        ensure_end(r)?;
                         if let Some(chan) = self.channels.get(&channel_num) {
                             chan.send(ChannelMsg::Signal {
                                 signal: signal.clone(),
