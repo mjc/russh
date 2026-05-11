@@ -985,6 +985,7 @@ impl Session {
                         let row_height = map_err!(u32::decode(r))?;
                         let pix_width = map_err!(u32::decode(r))?;
                         let pix_height = map_err!(u32::decode(r))?;
+                        ensure_end(r)?;
 
                         if let Some(chan) = self.channels.get(&channel_num) {
                             let _ = chan
