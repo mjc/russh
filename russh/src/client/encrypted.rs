@@ -27,7 +27,9 @@ use crate::cert::PublicKeyOrCertificate;
 use crate::client::{Handler, Msg, Prompt, Reply, Session};
 use crate::helpers::{AlgorithmExt, EncodedExt, NameList, sign_with_hash_alg};
 use crate::keys::key::parse_public_key;
-use crate::parsing::{ChannelOpenConfirmation, ChannelType, OpenChannelMessage};
+use crate::parsing::{
+    ChannelOpenConfirmation, ChannelType, OpenChannelMessage, validate_remote_channel_packet_size,
+};
 use crate::session::{Encrypted, EncryptedState, GlobalRequestResponse};
 use crate::{
     Channel, ChannelId, ChannelMsg, ChannelOpenFailure, ChannelParams, Error, MethodSet, Sig, auth,
@@ -360,6 +362,7 @@ impl Session {
             Some((&msg::CHANNEL_OPEN_CONFIRMATION, mut reader)) => {
                 debug!("channel_open_confirmation");
                 let msg = map_err!(ChannelOpenConfirmation::decode(&mut reader))?;
+                validate_remote_channel_packet_size(msg.maximum_packet_size)?;
                 let local_id = ChannelId(msg.recipient_channel);
 
                 if let Some(ref mut enc) = self.common.encrypted {
@@ -661,6 +664,7 @@ impl Session {
             }
             Some((&msg::CHANNEL_OPEN, mut r)) => {
                 let msg = OpenChannelMessage::parse(&mut r)?;
+                validate_remote_channel_packet_size(msg.recipient_maximum_packet_size)?;
 
                 if let Some(ref mut enc) = self.common.encrypted {
                     let id = enc.new_channel_id();

@@ -32,7 +32,9 @@ use super::*;
 use crate::helpers::NameList;
 use crate::map_err;
 use crate::msg::SSH_OPEN_ADMINISTRATIVELY_PROHIBITED;
-use crate::parsing::{ChannelOpenConfirmation, ChannelType, OpenChannelMessage};
+use crate::parsing::{
+    ChannelOpenConfirmation, ChannelType, OpenChannelMessage, validate_remote_channel_packet_size,
+};
 
 impl Session {
     /// Returns false iff a request was rejected.
@@ -740,6 +742,7 @@ impl Session {
             msg::CHANNEL_OPEN_CONFIRMATION => {
                 debug!("channel_open_confirmation");
                 let msg = map_err!(ChannelOpenConfirmation::decode(r))?;
+                validate_remote_channel_packet_size(msg.maximum_packet_size)?;
                 let local_id = ChannelId(msg.recipient_channel);
 
                 if let Some(ref mut enc) = self.common.encrypted {

@@ -398,6 +398,9 @@ impl Encrypted {
         if from >= buf0.len() {
             return Ok(0);
         }
+        if channel.recipient_maximum_packet_size == 0 {
+            return Err(crate::Error::PacketSize(0));
+        }
         let mut buf = if buf0.len() as u32 > from as u32 + channel.recipient_window_size {
             #[allow(clippy::indexing_slicing)] // length checked
             &buf0[from..from + channel.recipient_window_size as usize]
@@ -705,6 +708,22 @@ mod tests {
             pending_eof,
             pending_close,
         }
+    }
+
+    #[test]
+    fn data_rejects_zero_remote_max_packet_without_looping() {
+        let channel_id = ChannelId(10);
+        let mut channel = test_channel(channel_id, 42, false, false);
+        channel.recipient_maximum_packet_size = 0;
+        channel.pending_data.clear();
+
+        let mut encrypted = test_encrypted();
+        encrypted.channels.insert(channel_id, channel);
+
+        assert!(matches!(
+            encrypted.data(channel_id, Bytes::from_static(b"hello"), false),
+            Err(crate::Error::PacketSize(0))
+        ));
     }
 
     // flush_pending (single-channel path)
