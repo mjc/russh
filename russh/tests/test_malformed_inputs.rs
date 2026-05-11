@@ -18,6 +18,7 @@ use futures::stream;
 use russh::keys::PublicKeyBase64;
 use russh::keys::agent::client::AgentClient;
 use russh::{Channel, ChannelId, Pty, cipher, client, compression, kex, mac, server};
+use ssh_encoding::Encode;
 use ssh_key::{Algorithm, PrivateKey};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
@@ -35,7 +36,11 @@ const EXCESSIVE_AGENT_IDENTITY_COUNT: u32 = 2049;
 #[cfg(feature = "flate2")]
 const OVERSIZED_DECOMPRESSED_LEN: usize = 2 * 1024 * 1024;
 const OVERSIZED_AGENT_MESSAGE_LEN: usize = 4 * 1024 * 1024;
+const MSG_AGENT_FAILURE: u8 = 5;
+const MSG_AGENT_SUCCESS: u8 = 6;
+const MSG_AGENT_SIGN_REQUEST: u8 = 13;
 const MSG_AGENT_IDENTITIES_ANSWER: u8 = 12;
+const MSG_AGENT_ADD_IDENTITY: u8 = 17;
 
 #[tokio::test]
 async fn malformed_pty_req_truncated_modes_rejected_by_server() {
@@ -260,6 +265,47 @@ async fn agent_client_rejects_oversized_extension_before_write() {
         !saw_write.load(Ordering::SeqCst),
         "agent client wrote an oversized outbound request"
     );
+}
+
+#[tokio::test]
+async fn agent_server_rejects_sign_request_missing_flags() {
+    let (mut client_stream, server_stream) = tokio::io::duplex(16 * 1024);
+    let listener = stream::iter(vec![Ok(server_stream)]);
+    let serve = tokio::spawn(async move {
+        let _ = russh::keys::agent::server::serve(listener, ()).await;
+    });
+
+    let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
+    let mut add_identity = Vec::new();
+    add_identity.push(MSG_AGENT_ADD_IDENTITY);
+    key.key_data().encode(&mut add_identity).unwrap();
+    encode_string(&mut add_identity, b"");
+    client_stream
+        .write_all(&agent_frame(&add_identity))
+        .await
+        .unwrap();
+
+    let add_response = read_agent_response(&mut client_stream).await.unwrap();
+    assert_eq!(add_response.first(), Some(&MSG_AGENT_SUCCESS));
+
+    let mut sign_request = Vec::new();
+    sign_request.push(MSG_AGENT_SIGN_REQUEST);
+    encode_string(&mut sign_request, &key.public_key_bytes());
+    encode_string(&mut sign_request, b"data to sign");
+    client_stream
+        .write_all(&agent_frame(&sign_request))
+        .await
+        .unwrap();
+
+    let sign_response = read_agent_response(&mut client_stream).await.unwrap();
+    assert_eq!(
+        sign_response.first(),
+        Some(&MSG_AGENT_FAILURE),
+        "agent server accepted a sign request with no flags field"
+    );
+
+    drop(client_stream);
+    serve.abort();
 }
 
 #[tokio::test]
@@ -709,6 +755,21 @@ fn encode_name_list(buf: &mut Vec<u8>, names: &[&str]) {
 fn encode_string(buf: &mut Vec<u8>, value: &[u8]) {
     push_u32(buf, value.len() as u32);
     buf.extend_from_slice(value);
+}
+
+fn agent_frame(body: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(body.len() + 4);
+    push_u32(&mut frame, body.len() as u32);
+    frame.extend_from_slice(body);
+    frame
+}
+
+async fn read_agent_response(stream: &mut tokio::io::DuplexStream) -> io::Result<Vec<u8>> {
+    let mut len = [0; 4];
+    stream.read_exact(&mut len).await?;
+    let mut body = vec![0; BigEndian::read_u32(&len) as usize];
+    stream.read_exact(&mut body).await?;
+    Ok(body)
 }
 
 fn push_u32(buf: &mut Vec<u8>, value: u32) {

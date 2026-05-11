@@ -320,7 +320,10 @@ impl<S: AsyncRead + AsyncWrite + Send + Unpin + 'static, A: Agent + Send + Sync 
     ) -> Result<(A, bool), Error> {
         let mut needs_confirm = false;
         let key = {
-            let blob = Bytes::decode(r)?;
+            let blob = match Bytes::decode(r) {
+                Ok(blob) => blob,
+                Err(_) => return Ok((agent, false)),
+            };
             let k = self.keys.0.read().or(Err(Error::AgentFailure))?;
             if let Some((key, _, constraints)) = k.get(&blob.to_vec()) {
                 if constraints.contains(&Constraint::Confirm) {
@@ -344,9 +347,16 @@ impl<S: AsyncRead + AsyncWrite + Send + Unpin + 'static, A: Agent + Send + Sync 
         } else {
             agent
         };
-        writebuf.push(msg::SIGN_RESPONSE);
-        let data = Bytes::decode(r)?;
+        let data = match Bytes::decode(r) {
+            Ok(data) => data,
+            Err(_) => return Ok((agent, false)),
+        };
+        let _flags = match u32::decode(r) {
+            Ok(flags) => flags,
+            Err(_) => return Ok((agent, false)),
+        };
 
+        writebuf.push(msg::SIGN_RESPONSE);
         sign_with_hash_alg(&PrivateKeyWithHashAlg::new(key, None), &data)?.encode(writebuf)?;
 
         let len = writebuf.len();
