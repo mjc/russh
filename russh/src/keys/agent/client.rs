@@ -13,6 +13,8 @@ use crate::CryptoVec;
 use crate::helpers::EncodedExt;
 use crate::keys::{Error, key};
 
+const MAX_AGENT_MESSAGE_LEN: usize = 256 * 1024;
+
 pub trait AgentStream: AsyncRead + AsyncWrite {}
 
 impl<S: AsyncRead + AsyncWrite> AgentStream for S {}
@@ -124,6 +126,9 @@ impl<S: AgentStream + Unpin> AgentClient<S> {
 
         // Reading the rest of the buffer
         let len = BigEndian::read_u32(&self.buf) as usize;
+        if len > MAX_AGENT_MESSAGE_LEN {
+            return Err(Error::AgentProtocolError);
+        }
         self.buf.clear();
         self.buf.resize(len, 0);
         self.stream.read_exact(&mut self.buf).await?;

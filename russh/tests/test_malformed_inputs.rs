@@ -4,17 +4,21 @@
 
 use std::borrow::Cow;
 use std::io;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use byteorder::{BigEndian, ByteOrder};
 #[cfg(feature = "flate2")]
 use flate2::FlushCompress;
+use futures::stream;
+use russh::keys::agent::client::AgentClient;
 use russh::{Channel, ChannelId, Pty, cipher, client, compression, kex, mac, server};
 use ssh_key::{Algorithm, PrivateKey};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 const MSG_SERVICE_REQUEST: u8 = 5;
 const MSG_SERVICE_ACCEPT: u8 = 6;
@@ -28,6 +32,7 @@ const MSG_CHANNEL_REQUEST: u8 = 98;
 const EXCESSIVE_PROMPT_COUNT: u32 = 1025;
 #[cfg(feature = "flate2")]
 const OVERSIZED_DECOMPRESSED_LEN: usize = 2 * 1024 * 1024;
+const OVERSIZED_AGENT_MESSAGE_LEN: usize = 4 * 1024 * 1024;
 
 #[tokio::test]
 async fn malformed_pty_req_truncated_modes_rejected_by_server() {
@@ -134,6 +139,70 @@ async fn zlib_decompression_rejects_excessive_expansion() {
             Err(russh::Error::PacketSize(_))
         ),
         "decompression should reject expansion beyond the transport packet bound"
+    );
+}
+
+#[tokio::test]
+async fn agent_client_rejects_oversized_response_before_body_read() {
+    let saw_body_read = Arc::new(AtomicBool::new(false));
+    let stream = OversizedAgentResponse {
+        stage: 0,
+        saw_body_read: saw_body_read.clone(),
+    };
+    let mut client = AgentClient::connect(stream);
+
+    let result = tokio::time::timeout(Duration::from_secs(3), client.request_identities()).await;
+
+    assert!(
+        matches!(result, Ok(Err(_))),
+        "agent client did not fail after an oversized response length: {result:?}"
+    );
+    assert!(
+        !saw_body_read.load(Ordering::SeqCst),
+        "agent client attempted to read an oversized response body"
+    );
+}
+
+#[tokio::test]
+async fn agent_server_rejects_oversized_request_before_body_read() {
+    let saw_body_read = Arc::new(AtomicBool::new(false));
+    let stream = OversizedAgentRequest {
+        stage: 0,
+        saw_body_read: saw_body_read.clone(),
+    };
+    let listener = stream::iter(vec![Ok(stream)]);
+
+    let serve = tokio::spawn(async move {
+        let _ = russh::keys::agent::server::serve(listener, ()).await;
+    });
+
+    tokio::time::timeout(Duration::from_secs(3), serve)
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert!(
+        !saw_body_read.load(Ordering::SeqCst),
+        "agent server attempted to read an oversized request body"
+    );
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn pageant_rejects_oversized_response_before_body_read() {
+    let saw_body_read = Arc::new(AtomicBool::new(false));
+    let stream = OversizedAgentResponse {
+        stage: 0,
+        saw_body_read: saw_body_read.clone(),
+    };
+    let mut client = AgentClient::connect(stream);
+
+    let result = tokio::time::timeout(Duration::from_secs(3), client.request_identities()).await;
+
+    assert!(matches!(result, Ok(Err(_))));
+    assert!(
+        !saw_body_read.load(Ordering::SeqCst),
+        "Pageant-compatible agent framing attempted to read an oversized response body"
     );
 }
 
@@ -510,5 +579,97 @@ impl client::Handler for MalformedInputClient {
         _server_public_key: &ssh_key::PublicKey,
     ) -> Result<bool, Self::Error> {
         Ok(true)
+    }
+}
+
+struct OversizedAgentResponse {
+    stage: u8,
+    saw_body_read: Arc<AtomicBool>,
+}
+
+impl AsyncRead for OversizedAgentResponse {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if self.stage == 0 {
+            buf.put_slice(&(OVERSIZED_AGENT_MESSAGE_LEN as u32).to_be_bytes());
+            self.stage = 1;
+            return Poll::Ready(Ok(()));
+        }
+
+        if buf.remaining() >= OVERSIZED_AGENT_MESSAGE_LEN {
+            self.saw_body_read.store(true, Ordering::SeqCst);
+        }
+
+        Poll::Ready(Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "oversized response body read",
+        )))
+    }
+}
+
+impl AsyncWrite for OversizedAgentResponse {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+struct OversizedAgentRequest {
+    stage: u8,
+    saw_body_read: Arc<AtomicBool>,
+}
+
+impl AsyncRead for OversizedAgentRequest {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if self.stage == 0 {
+            buf.put_slice(&(OVERSIZED_AGENT_MESSAGE_LEN as u32).to_be_bytes());
+            self.stage = 1;
+            return Poll::Ready(Ok(()));
+        }
+
+        if buf.remaining() >= OVERSIZED_AGENT_MESSAGE_LEN {
+            self.saw_body_read.store(true, Ordering::SeqCst);
+        }
+
+        Poll::Ready(Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "oversized request body read",
+        )))
+    }
+}
+
+impl AsyncWrite for OversizedAgentRequest {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
     }
 }

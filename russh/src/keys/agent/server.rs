@@ -19,6 +19,8 @@ use crate::keys::key::PrivateKeyWithHashAlg;
 use crate::keys::Error;
 use crate::CryptoVec;
 
+const MAX_AGENT_MESSAGE_LEN: usize = 256 * 1024;
+
 #[derive(Clone)]
 #[allow(clippy::type_complexity)]
 struct KeyStore(Arc<RwLock<HashMap<Vec<u8>, (Arc<PrivateKey>, SystemTime, Vec<Constraint>)>>>);
@@ -106,6 +108,9 @@ impl<S: AsyncRead + AsyncWrite + Send + Unpin + 'static, A: Agent + Send + Sync 
             self.s.read_exact(&mut self.buf).await?;
             // Reading the rest of the buffer
             let len = BigEndian::read_u32(&self.buf) as usize;
+            if len > MAX_AGENT_MESSAGE_LEN {
+                return Err(Error::AgentProtocolError);
+            }
             self.buf.clear();
             self.buf.resize(len, 0);
             self.s.read_exact(&mut self.buf).await?;
