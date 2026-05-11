@@ -33,7 +33,8 @@ use crate::helpers::NameList;
 use crate::map_err;
 use crate::msg::SSH_OPEN_ADMINISTRATIVELY_PROHIBITED;
 use crate::parsing::{
-    ChannelOpenConfirmation, ChannelType, OpenChannelMessage, validate_remote_channel_packet_size,
+    ChannelOpenConfirmation, ChannelType, OpenChannelMessage, ensure_end,
+    validate_remote_channel_packet_size,
 };
 
 impl Session {
@@ -75,6 +76,7 @@ impl Session {
                 Some((&msg::SERVICE_REQUEST, mut r)),
             ) => {
                 let request = map_err!(String::decode(&mut r))?;
+                ensure_end(&r)?;
                 debug!("request: {request:?}");
                 if request == "ssh-userauth" {
                     let auth_request = server_accept_service(
@@ -198,8 +200,18 @@ impl Encrypted {
                 };
                 auth_user.clear();
                 auth_user.push_str(&user);
-                map_err!(u8::decode(r))?;
+                let password_change = map_err!(u8::decode(r))? != 0;
                 let password = map_err!(String::decode(r))?;
+                if password_change {
+                    let _new_password = map_err!(String::decode(r))?;
+                    ensure_end(r)?;
+                    auth_user.clear();
+                    auth_request.methods.remove(MethodKind::Password);
+                    auth_request.partial_success = false;
+                    reject_auth_request(until, &mut self.write, auth_request).await?;
+                    return Ok(());
+                }
+                ensure_end(r)?;
                 let auth = handler.auth_password(&user, &password).await?;
                 if let Auth::Accept = auth {
                     server_auth_request_success(&mut self.write);
@@ -231,6 +243,7 @@ impl Encrypted {
                 )
                 .await
             } else if method == "none" {
+                ensure_end(r)?;
                 let auth_request = if let EncryptedState::WaitingAuthRequest(ref mut a) = self.state
                 {
                     a
@@ -271,6 +284,7 @@ impl Encrypted {
                 auth_user.push_str(&user);
                 let _ = map_err!(String::decode(r))?; // language_tag, deprecated.
                 let submethods = map_err!(String::decode(r))?;
+                ensure_end(r)?;
                 debug!("{submethods:?}");
                 auth_request.current = Some(CurrentRequest::KeyboardInteractive {
                     submethods: submethods.to_string(),
@@ -375,8 +389,11 @@ impl Encrypted {
                     };
 
                     let encoded_signature = map_err!(Vec::<u8>::decode(r))?;
+                    ensure_end(r)?;
 
-                    let sig = map_err!(Signature::decode(&mut encoded_signature.as_slice()))?;
+                    let mut signature_reader = encoded_signature.as_slice();
+                    let sig = map_err!(Signature::decode(&mut signature_reader))?;
+                    ensure_end(&signature_reader)?;
 
                     let is_valid = if sent_pk_ok && user == auth_user {
                         true
@@ -435,6 +452,7 @@ impl Encrypted {
                     }
                     Ok(())
                 } else {
+                    ensure_end(r)?;
                     auth_user.clear();
                     auth_user.push_str(user);
                     let auth = handler.auth_publickey_offered(user, &pubkey).await?;
@@ -537,6 +555,7 @@ async fn read_userauth_info_response<H: Handler + Send, R: Reader>(
         for _ in 0..n {
             responses.push(Bytes::decode(r).ok())
         }
+        ensure_end(r)?;
 
         let auth = handler
             .auth_keyboard_interactive(user, submethods, Some(Response(&mut responses.into_iter())))

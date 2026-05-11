@@ -187,6 +187,97 @@ async fn agent_server_rejects_oversized_request_before_body_read() {
     );
 }
 
+#[tokio::test]
+async fn service_request_with_trailing_bytes_rejected_by_server() {
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        raw_service_request_signal(|payload| {
+            payload.push(MSG_SERVICE_REQUEST);
+            encode_string(payload, b"ssh-userauth");
+            payload.push(0);
+        }),
+    )
+    .await;
+
+    assert!(
+        matches!(
+            result,
+            Ok(ServerSignal::Closed | ServerSignal::ProtocolError(_))
+        ),
+        "server accepted a service request with trailing bytes: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn auth_none_with_trailing_bytes_rejected_by_server() {
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        raw_auth_request_signal(|payload| {
+            payload.push(MSG_USERAUTH_REQUEST);
+            encode_string(payload, b"test");
+            encode_string(payload, b"ssh-connection");
+            encode_string(payload, b"none");
+            payload.push(0);
+        }),
+    )
+    .await;
+
+    assert!(
+        matches!(
+            result,
+            Ok(ServerSignal::Closed | ServerSignal::ProtocolError(_))
+        ),
+        "server accepted a none auth request with trailing bytes: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn auth_password_with_trailing_bytes_rejected_by_server() {
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        raw_auth_request_signal(|payload| {
+            payload.push(MSG_USERAUTH_REQUEST);
+            encode_string(payload, b"test");
+            encode_string(payload, b"ssh-connection");
+            encode_string(payload, b"password");
+            payload.push(0);
+            encode_string(payload, b"secret");
+            payload.push(0);
+        }),
+    )
+    .await;
+
+    assert!(
+        matches!(
+            result,
+            Ok(ServerSignal::Closed | ServerSignal::ProtocolError(_))
+        ),
+        "server accepted a password auth request with trailing bytes: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn auth_password_change_request_uses_normal_rejection_path() {
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        raw_auth_request_signal(|payload| {
+            payload.push(MSG_USERAUTH_REQUEST);
+            encode_string(payload, b"test");
+            encode_string(payload, b"ssh-connection");
+            encode_string(payload, b"password");
+            payload.push(1);
+            encode_string(payload, b"old-secret");
+            encode_string(payload, b"new-secret");
+        }),
+    )
+    .await;
+
+    assert!(
+        matches!(result, Ok(ServerSignal::Survived)),
+        "password change request should be rejected without a protocol error: {result:?}"
+    );
+}
+
 #[cfg(windows)]
 #[tokio::test]
 async fn pageant_rejects_oversized_response_before_body_read() {
@@ -324,6 +415,75 @@ async fn keyboard_interactive_prompt_count_signal() -> ServerSignal {
     match result {
         Ok(_) => ServerSignal::Closed,
         Err(error) => ServerSignal::ProtocolError(error.to_string()),
+    }
+}
+
+async fn raw_service_request_signal(
+    build_payload: impl FnOnce(&mut Vec<u8>) + 'static,
+) -> ServerSignal {
+    raw_auth_phase_signal(|stream| {
+        Box::pin(async move {
+            let mut payload = Vec::new();
+            build_payload(&mut payload);
+            stream.write_all(&ssh_packet(&payload)).await?;
+            stream.flush().await
+        })
+    })
+    .await
+}
+
+async fn raw_auth_request_signal(
+    build_payload: impl FnOnce(&mut Vec<u8>) + 'static,
+) -> ServerSignal {
+    raw_auth_phase_signal(|stream| {
+        Box::pin(async move {
+            let mut service = Vec::new();
+            service.push(MSG_SERVICE_REQUEST);
+            encode_string(&mut service, b"ssh-userauth");
+            stream.write_all(&ssh_packet(&service)).await?;
+
+            let accept = read_packet(stream).await?;
+            assert_eq!(accept.first(), Some(&MSG_SERVICE_ACCEPT));
+
+            let mut payload = Vec::new();
+            build_payload(&mut payload);
+            stream.write_all(&ssh_packet(&payload)).await?;
+            stream.flush().await
+        })
+    })
+    .await
+}
+
+async fn raw_auth_phase_signal<F>(send_malformed: F) -> ServerSignal
+where
+    F: for<'a> FnOnce(
+        &'a mut tokio::net::TcpStream,
+    ) -> Pin<Box<dyn std::future::Future<Output = io::Result<()>> + 'a>>,
+{
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let mut server_task = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let running = server::run_stream(no_crypto_server_config(), socket, MalformedInputServer)
+            .await
+            .unwrap();
+        running.await
+    });
+
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    raw_client_no_crypto_handshake(&mut stream).await.unwrap();
+    send_malformed(&mut stream).await.unwrap();
+
+    match tokio::time::timeout(Duration::from_millis(200), &mut server_task).await {
+        Ok(Ok(Ok(()))) => ServerSignal::Closed,
+        Ok(Ok(Err(error))) => ServerSignal::ProtocolError(error.to_string()),
+        Ok(Err(join)) if join.is_panic() => ServerSignal::Panicked,
+        Err(_) => {
+            server_task.abort();
+            ServerSignal::Survived
+        }
+        _ => ServerSignal::Closed,
     }
 }
 
