@@ -10,6 +10,8 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use byteorder::{BigEndian, ByteOrder};
+#[cfg(feature = "flate2")]
+use flate2::FlushCompress;
 use russh::{Channel, ChannelId, Pty, cipher, client, compression, kex, mac, server};
 use ssh_key::{Algorithm, PrivateKey};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -24,6 +26,8 @@ const MSG_CHANNEL_OPEN: u8 = 90;
 const MSG_CHANNEL_OPEN_CONFIRMATION: u8 = 91;
 const MSG_CHANNEL_REQUEST: u8 = 98;
 const EXCESSIVE_PROMPT_COUNT: u32 = 1025;
+#[cfg(feature = "flate2")]
+const OVERSIZED_DECOMPRESSED_LEN: usize = 2 * 1024 * 1024;
 
 #[tokio::test]
 async fn malformed_pty_req_truncated_modes_rejected_by_server() {
@@ -109,6 +113,27 @@ async fn keyboard_interactive_rejects_excessive_prompt_count() {
     assert!(
         matches!(result, Ok(ServerSignal::ProtocolError(_))),
         "client did not reject a large keyboard-interactive prompt count: {result:?}"
+    );
+}
+
+#[tokio::test]
+#[cfg(feature = "flate2")]
+async fn zlib_decompression_rejects_excessive_expansion() {
+    let compressed = compressed_zero_payload(OVERSIZED_DECOMPRESSED_LEN);
+    assert!(
+        compressed.len() < OVERSIZED_DECOMPRESSED_LEN / 128,
+        "fixture is not a high-ratio compressed payload"
+    );
+
+    let mut decompressor = compression::Decompress::Zlib(flate2::Decompress::new(false));
+    let mut output = Vec::new();
+
+    assert!(
+        matches!(
+            decompressor.decompress(&compressed, &mut output),
+            Err(russh::Error::PacketSize(_))
+        ),
+        "decompression should reject expansion beyond the transport packet bound"
     );
 }
 
@@ -386,6 +411,34 @@ fn push_u32(buf: &mut Vec<u8>, value: u32) {
     let mut bytes = [0; 4];
     BigEndian::write_u32(&mut bytes, value);
     buf.extend_from_slice(&bytes);
+}
+
+#[cfg(feature = "flate2")]
+fn compressed_zero_payload(len: usize) -> Vec<u8> {
+    let input = vec![0; len];
+    let mut compressor = flate2::Compress::new(flate2::Compression::best(), false);
+    let mut output = vec![0; 1024];
+    let n_in = compressor.total_in() as usize;
+    let n_out = compressor.total_out() as usize;
+    loop {
+        let n_in_now = compressor.total_in() as usize - n_in;
+        let n_out_now = compressor.total_out() as usize - n_out;
+        match compressor
+            .compress(
+                &input[n_in_now..],
+                &mut output[n_out_now..],
+                FlushCompress::Finish,
+            )
+            .unwrap()
+        {
+            flate2::Status::BufError => output.resize(output.len() * 2, 0),
+            flate2::Status::Ok => output.resize(output.len() * 2, 0),
+            flate2::Status::StreamEnd => {
+                output.truncate(compressor.total_out() as usize);
+                return output;
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
