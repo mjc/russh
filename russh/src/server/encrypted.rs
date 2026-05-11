@@ -844,6 +844,7 @@ impl Session {
                                 mode_string = remaining;
                             }
                         }
+                        ensure_end(r)?;
 
                         if let Some(chan) = self.channels.get(&channel_num) {
                             let _ = chan

@@ -108,6 +108,27 @@ async fn malformed_pty_req_rejects_bytes_after_mode_end() {
 }
 
 #[tokio::test]
+async fn malformed_pty_req_trailing_bytes_rejected_by_server() {
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        raw_pty_req_signal(|server_channel| {
+            let mut payload = pty_req_payload(server_channel, &[Pty::TTY_OP_END as u8]);
+            payload.push(0);
+            payload
+        }),
+    )
+    .await;
+
+    assert!(
+        matches!(
+            result,
+            Ok(ServerSignal::Closed | ServerSignal::ProtocolError(_))
+        ),
+        "server accepted a pty request with trailing bytes: {result:?}"
+    );
+}
+
+#[tokio::test]
 async fn keyboard_interactive_rejects_excessive_prompt_count() {
     let result = tokio::time::timeout(
         Duration::from_secs(3),
