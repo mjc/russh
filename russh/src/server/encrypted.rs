@@ -951,6 +951,7 @@ impl Session {
                     }
                     "exec" => {
                         let req = map_err!(Bytes::decode(r))?;
+                        ensure_end(r)?;
                         if let Some(chan) = self.channels.get(&channel_num) {
                             let _ = chan
                                 .send(ChannelMsg::Exec {

@@ -162,6 +162,28 @@ async fn env_request_with_trailing_bytes_rejected_by_server() {
 }
 
 #[tokio::test]
+async fn exec_request_with_trailing_bytes_rejected_by_server() {
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        raw_pty_req_signal(|server_channel| {
+            let mut payload = channel_request_payload(server_channel, b"exec");
+            encode_string(&mut payload, b"true");
+            payload.push(0);
+            payload
+        }),
+    )
+    .await;
+
+    assert!(
+        matches!(
+            result,
+            Ok(ServerSignal::Closed | ServerSignal::ProtocolError(_))
+        ),
+        "server accepted an exec request with trailing bytes: {result:?}"
+    );
+}
+
+#[tokio::test]
 async fn keyboard_interactive_rejects_excessive_prompt_count() {
     let result = tokio::time::timeout(
         Duration::from_secs(3),
