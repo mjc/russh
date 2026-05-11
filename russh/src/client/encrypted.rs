@@ -34,6 +34,8 @@ use crate::{
     map_err, msg,
 };
 
+const MAX_KEYBOARD_INTERACTIVE_PROMPTS: usize = 1024;
+
 impl Session {
     pub(crate) async fn client_read_encrypted<H: Handler>(
         &mut self,
@@ -160,10 +162,17 @@ impl Session {
 
                                 let _lang = map_err!(String::decode(&mut r))?;
                                 let n_prompts = map_err!(u32::decode(&mut r))?;
+                                let n_prompts = usize::try_from(n_prompts)
+                                    .map_err(|_| crate::Error::PacketSize(usize::MAX))?;
+                                if n_prompts > MAX_KEYBOARD_INTERACTIVE_PROMPTS {
+                                    return Err(crate::Error::PacketSize(n_prompts).into());
+                                }
+                                if n_prompts > r.len() / 5 {
+                                    return Err(crate::Error::PacketSize(n_prompts).into());
+                                }
 
                                 // read prompts
-                                let mut prompts =
-                                    Vec::with_capacity(n_prompts.try_into().unwrap_or(0));
+                                let mut prompts = Vec::with_capacity(n_prompts);
                                 for _i in 0..n_prompts {
                                     let prompt = map_err!(String::decode(&mut r))?;
 

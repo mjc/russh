@@ -10,7 +10,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use byteorder::{BigEndian, ByteOrder};
-use russh::{Channel, ChannelId, Pty, cipher, compression, kex, mac, server};
+use russh::{Channel, ChannelId, Pty, cipher, client, compression, kex, mac, server};
 use ssh_key::{Algorithm, PrivateKey};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -23,6 +23,7 @@ const MSG_USERAUTH_SUCCESS: u8 = 52;
 const MSG_CHANNEL_OPEN: u8 = 90;
 const MSG_CHANNEL_OPEN_CONFIRMATION: u8 = 91;
 const MSG_CHANNEL_REQUEST: u8 = 98;
+const EXCESSIVE_PROMPT_COUNT: u32 = 1025;
 
 #[tokio::test]
 async fn malformed_pty_req_truncated_modes_rejected_by_server() {
@@ -97,6 +98,20 @@ async fn malformed_pty_req_rejects_bytes_after_mode_end() {
     );
 }
 
+#[tokio::test]
+async fn keyboard_interactive_rejects_excessive_prompt_count() {
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        keyboard_interactive_prompt_count_signal(),
+    )
+    .await;
+
+    assert!(
+        matches!(result, Ok(ServerSignal::ProtocolError(_))),
+        "client did not reject a large keyboard-interactive prompt count: {result:?}"
+    );
+}
+
 #[derive(Debug)]
 enum ServerSignal {
     Closed,
@@ -167,6 +182,54 @@ async fn raw_pty_req_signal(build_payload: impl FnOnce(u32) -> Vec<u8>) -> Serve
             ServerSignal::Survived
         }
         _ => ServerSignal::Closed,
+    }
+}
+
+async fn keyboard_interactive_prompt_count_signal() -> ServerSignal {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server_task = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut config = server::Config::default();
+        config.inactivity_timeout = None;
+        config.auth_rejection_time = Duration::from_millis(1);
+        config.auth_rejection_time_initial = Some(Duration::from_millis(1));
+        config
+            .keys
+            .push(PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap());
+        let running = server::run_stream(
+            Arc::new(config),
+            socket,
+            MalformedPromptServer {
+                prompt_count: EXCESSIVE_PROMPT_COUNT,
+            },
+        )
+        .await
+        .unwrap();
+        let _ = running.await;
+    });
+
+    let result = match client::connect(
+        Arc::new(client::Config::default()),
+        addr,
+        MalformedInputClient,
+    )
+    .await
+    {
+        Ok(mut session) => {
+            session
+                .authenticate_keyboard_interactive_start("test", None::<String>)
+                .await
+        }
+        Err(error) => Err(error),
+    };
+
+    let _ = server_task.await;
+
+    match result {
+        Ok(_) => ServerSignal::Closed,
+        Err(error) => ServerSignal::ProtocolError(error.to_string()),
     }
 }
 
@@ -355,5 +418,44 @@ impl server::Handler for MalformedInputServer {
         _session: &mut server::Session,
     ) -> Result<(), Self::Error> {
         Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct MalformedPromptServer {
+    prompt_count: u32,
+}
+
+impl server::Handler for MalformedPromptServer {
+    type Error = russh::Error;
+
+    async fn auth_keyboard_interactive<'a>(
+        &'a mut self,
+        _user: &str,
+        _submethods: &str,
+        _response: Option<server::Response<'a>>,
+    ) -> Result<server::Auth, Self::Error> {
+        let prompts = (0..self.prompt_count)
+            .map(|_| (Cow::Borrowed("test"), false))
+            .collect::<Vec<_>>();
+
+        Ok(server::Auth::Partial {
+            name: Cow::Borrowed("test"),
+            instructions: Cow::Borrowed("too many prompts"),
+            prompts: Cow::Owned(prompts),
+        })
+    }
+}
+
+struct MalformedInputClient;
+
+impl client::Handler for MalformedInputClient {
+    type Error = russh::Error;
+
+    async fn check_server_key(
+        &mut self,
+        _server_public_key: &ssh_key::PublicKey,
+    ) -> Result<bool, Self::Error> {
+        Ok(true)
     }
 }
