@@ -527,7 +527,10 @@ async fn read_userauth_info_response<H: Handler + Send, R: Reader>(
         // billions of loop iterations with a crafted count.
         // Each response needs at least 4 bytes (length prefix).
         let max_responses = r.remaining_len().saturating_add(3) / 4;
-        let n = (n as usize).min(max_responses);
+        let n = n as usize;
+        if n > max_responses {
+            return Err(Error::PacketSize(n).into());
+        }
         let mut responses = Vec::with_capacity(n);
         for _ in 0..n {
             responses.push(Bytes::decode(r).ok())
@@ -543,6 +546,45 @@ async fn read_userauth_info_response<H: Handler + Send, R: Reader>(
     } else {
         reject_auth_request(until, write, auth_request).await?;
         Ok(false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct RejectingHandler;
+
+    impl Handler for RejectingHandler {
+        type Error = Error;
+    }
+
+    #[tokio::test]
+    async fn userauth_info_response_rejects_count_larger_than_remaining_packet() {
+        let mut handler = RejectingHandler;
+        let mut write = Vec::new();
+        let mut auth_request = AuthRequest {
+            methods: MethodSet::all(),
+            partial_success: false,
+            current: Some(CurrentRequest::KeyboardInteractive {
+                submethods: String::new(),
+            }),
+            rejection_count: 0,
+        };
+        let count = 2u32.to_be_bytes();
+        let mut packet = count.as_slice();
+
+        let result = read_userauth_info_response(
+            Instant::now(),
+            &mut handler,
+            &mut write,
+            &mut auth_request,
+            "test",
+            &mut packet,
+        )
+        .await;
+
+        assert!(matches!(result, Err(Error::PacketSize(2))));
     }
 }
 
