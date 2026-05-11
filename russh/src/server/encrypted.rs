@@ -925,6 +925,7 @@ impl Session {
                             .await
                     }
                     "shell" => {
+                        ensure_end(r)?;
                         if let Some(chan) = self.channels.get(&channel_num) {
                             let _ = chan
                                 .send(ChannelMsg::RequestShell { want_reply: true })
