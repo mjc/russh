@@ -965,6 +965,7 @@ impl Session {
                     }
                     "subsystem" => {
                         let name = map_err!(String::decode(r))?;
+                        ensure_end(r)?;
 
                         if let Some(chan) = self.channels.get(&channel_num) {
                             let _ = chan
