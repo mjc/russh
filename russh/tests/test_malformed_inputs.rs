@@ -15,6 +15,7 @@ use byteorder::{BigEndian, ByteOrder};
 #[cfg(feature = "flate2")]
 use flate2::FlushCompress;
 use futures::stream;
+use russh::keys::PublicKeyBase64;
 use russh::keys::agent::client::AgentClient;
 use russh::{Channel, ChannelId, Pty, cipher, client, compression, kex, mac, server};
 use ssh_key::{Algorithm, PrivateKey};
@@ -30,9 +31,11 @@ const MSG_CHANNEL_OPEN: u8 = 90;
 const MSG_CHANNEL_OPEN_CONFIRMATION: u8 = 91;
 const MSG_CHANNEL_REQUEST: u8 = 98;
 const EXCESSIVE_PROMPT_COUNT: u32 = 1025;
+const EXCESSIVE_AGENT_IDENTITY_COUNT: u32 = 2049;
 #[cfg(feature = "flate2")]
 const OVERSIZED_DECOMPRESSED_LEN: usize = 2 * 1024 * 1024;
 const OVERSIZED_AGENT_MESSAGE_LEN: usize = 4 * 1024 * 1024;
+const MSG_AGENT_IDENTITIES_ANSWER: u8 = 12;
 
 #[tokio::test]
 async fn malformed_pty_req_truncated_modes_rejected_by_server() {
@@ -206,6 +209,32 @@ async fn agent_server_rejects_oversized_request_before_body_read() {
         !saw_body_read.load(Ordering::SeqCst),
         "agent server attempted to read an oversized request body"
     );
+}
+
+#[tokio::test]
+async fn agent_client_rejects_excessive_identity_count() {
+    let key_blob = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)
+        .unwrap()
+        .public_key_bytes();
+    let mut body = Vec::new();
+    body.push(MSG_AGENT_IDENTITIES_ANSWER);
+    push_u32(&mut body, EXCESSIVE_AGENT_IDENTITY_COUNT);
+    for _ in 0..EXCESSIVE_AGENT_IDENTITY_COUNT {
+        encode_string(&mut body, &key_blob);
+        encode_string(&mut body, b"");
+    }
+
+    let mut client = AgentClient::connect(FixedAgentResponse::new(body));
+    let result = tokio::time::timeout(Duration::from_secs(3), client.request_identities()).await;
+
+    match result {
+        Ok(Err(_)) => {}
+        Ok(Ok(identities)) => panic!(
+            "agent client accepted {} identities, exceeding OpenSSH's cap",
+            identities.len()
+        ),
+        Err(_) => panic!("agent client hung on an excessive identity count"),
+    }
 }
 
 #[tokio::test]
@@ -812,6 +841,55 @@ impl AsyncWrite for OversizedAgentResponse {
 struct OversizedAgentRequest {
     stage: u8,
     saw_body_read: Arc<AtomicBool>,
+}
+
+struct FixedAgentResponse {
+    response: Vec<u8>,
+    offset: usize,
+}
+
+impl FixedAgentResponse {
+    fn new(body: Vec<u8>) -> Self {
+        let mut response = Vec::new();
+        push_u32(&mut response, body.len() as u32);
+        response.extend_from_slice(&body);
+        Self {
+            response,
+            offset: 0,
+        }
+    }
+}
+
+impl AsyncRead for FixedAgentResponse {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let remaining = &self.response[self.offset..];
+        let len = remaining.len().min(buf.remaining());
+        buf.put_slice(&remaining[..len]);
+        self.offset += len;
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl AsyncWrite for FixedAgentResponse {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
 }
 
 impl AsyncRead for OversizedAgentRequest {

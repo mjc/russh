@@ -14,6 +14,7 @@ use crate::helpers::EncodedExt;
 use crate::keys::{Error, key};
 
 const MAX_AGENT_MESSAGE_LEN: usize = 256 * 1024;
+const MAX_AGENT_IDENTITIES: usize = 2048;
 
 pub trait AgentStream: AsyncRead + AsyncWrite {}
 
@@ -273,7 +274,10 @@ impl<S: AgentStream + Unpin> AgentClient<S> {
 
         #[allow(clippy::indexing_slicing)] // static length
         if let Some((&msg::IDENTITIES_ANSWER, mut r)) = self.buf.split_first() {
-            let n = u32::decode(&mut r)?;
+            let n = u32::decode(&mut r)? as usize;
+            if n > MAX_AGENT_IDENTITIES {
+                return Err(Error::AgentProtocolError);
+            }
             for _ in 0..n {
                 let key_blob = Bytes::decode(&mut r)?;
                 let comment = String::decode(&mut r)?;
