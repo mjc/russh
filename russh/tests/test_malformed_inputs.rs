@@ -238,6 +238,31 @@ async fn agent_client_rejects_excessive_identity_count() {
 }
 
 #[tokio::test]
+async fn agent_client_rejects_oversized_extension_before_write() {
+    let saw_write = Arc::new(AtomicBool::new(false));
+    let stream = WriteTrackingAgentStream {
+        saw_write: saw_write.clone(),
+    };
+    let mut client = AgentClient::connect(stream);
+    let extension_data = vec![0; OVERSIZED_AGENT_MESSAGE_LEN];
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        client.extension(b"oversized@example.com", &extension_data),
+    )
+    .await;
+
+    assert!(
+        matches!(result, Ok(Err(_))),
+        "agent client accepted an oversized outbound extension request: {result:?}"
+    );
+    assert!(
+        !saw_write.load(Ordering::SeqCst),
+        "agent client wrote an oversized outbound request"
+    );
+}
+
+#[tokio::test]
 async fn service_request_with_trailing_bytes_rejected_by_server() {
     let result = tokio::time::timeout(
         Duration::from_secs(3),
@@ -880,6 +905,44 @@ impl AsyncWrite for FixedAgentResponse {
         _cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+struct WriteTrackingAgentStream {
+    saw_write: Arc<AtomicBool>,
+}
+
+impl AsyncRead for WriteTrackingAgentStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        _buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Poll::Ready(Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "unexpected read",
+        )))
+    }
+}
+
+impl AsyncWrite for WriteTrackingAgentStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        if !buf.is_empty() {
+            self.saw_write.store(true, Ordering::SeqCst);
+        }
         Poll::Ready(Ok(buf.len()))
     }
 

@@ -116,6 +116,11 @@ impl AgentClient<tokio::net::windows::named_pipe::NamedPipeClient> {
 
 impl<S: AgentStream + Unpin> AgentClient<S> {
     async fn read_response(&mut self) -> Result<(), Error> {
+        match self.buf.len().checked_sub(4) {
+            Some(len) if len <= MAX_AGENT_MESSAGE_LEN => {}
+            _ => return Err(Error::AgentProtocolError),
+        }
+
         // Writing the message
         self.stream.write_all(&self.buf).await?;
         self.stream.flush().await?;
