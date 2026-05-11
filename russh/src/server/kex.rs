@@ -13,6 +13,7 @@ use crate::kex::dh::biguint_to_mpint;
 use crate::kex::{KexAlgorithm, KexAlgorithmImplementor, KexCause, KEXES};
 use crate::keys::key::PrivateKeyWithHashAlg;
 use crate::negotiation::{is_key_compatible_with_algo, Names, Select};
+use crate::parsing::ensure_end;
 use crate::{msg, negotiation};
 
 thread_local! {
@@ -173,7 +174,9 @@ impl ServerKex {
                 }
 
                 #[allow(clippy::indexing_slicing)] // length checked
-                let gex_params = GexParams::decode(&mut &input.buffer[1..])?;
+                let mut r = &input.buffer[1..];
+                let gex_params = GexParams::decode(&mut r)?;
+                ensure_end(&r)?;
                 debug!("client requests a gex group: {gex_params:?}");
 
                 let Some(dh_group) = handler.lookup_dh_gex_group(&gex_params).await? else {
@@ -236,6 +239,7 @@ impl ServerKex {
                 self.exchange
                     .client_ephemeral
                     .extend_from_slice(&Bytes::decode(&mut r).map_err(Into::into)?);
+                ensure_end(&r)?;
 
                 let exchange = &mut self.exchange;
                 kex.server_dh(exchange, &input.buffer)?;

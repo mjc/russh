@@ -16,7 +16,7 @@ use std::borrow::Cow;
 
 use log::debug;
 use rand_core::Rng;
-use ssh_encoding::{Decode, Encode};
+use ssh_encoding::Encode;
 use ssh_key::{Algorithm, EcdsaCurve, HashAlg, PrivateKey};
 
 use crate::cipher::CIPHERS;
@@ -25,6 +25,7 @@ use crate::kex::{
     EXTENSION_OPENSSH_STRICT_KEX_AS_CLIENT, EXTENSION_OPENSSH_STRICT_KEX_AS_SERVER, KexCause,
 };
 use crate::keys::key::safe_rng;
+use crate::parsing::{ensure_end, take_name_list, take_u8, take_u32};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::server::Config;
 use crate::sshbuffer::PacketWriter;
@@ -190,7 +191,11 @@ impl Default for Preferred {
 }
 
 pub(crate) fn parse_kex_algo_list(list: &str) -> Vec<&str> {
-    list.split(',').collect()
+    if list.is_empty() {
+        Vec::new()
+    } else {
+        list.split(',').collect()
+    }
 }
 
 pub(crate) trait Select {
@@ -209,13 +214,15 @@ pub(crate) trait Select {
         available_host_keys: Option<&[PrivateKey]>,
         cause: &KexCause,
     ) -> Result<Names, Error> {
-        let &Some(mut r) = &buffer.get(17..) else {
+        if buffer.len() < 17 || buffer.first() != Some(&msg::KEXINIT) {
             return Err(Error::Inconsistent);
-        };
+        }
+        #[allow(clippy::indexing_slicing)] // length checked
+        let mut r = &buffer[17..];
 
         // Key exchange
 
-        let kex_string = String::decode(&mut r)?;
+        let kex_algos = take_name_list(&mut r)?;
         // Filter out extension kex names from both lists before selecting
         let _local_kexes_no_ext = pref
             .kex
@@ -223,8 +230,9 @@ pub(crate) trait Select {
             .filter(|k| !KEX_EXTENSION_NAMES.contains(k))
             .cloned()
             .collect::<Vec<_>>();
-        let _remote_kexes_no_ext = parse_kex_algo_list(&kex_string)
-            .into_iter()
+        let _remote_kexes_no_ext = kex_algos
+            .iter()
+            .copied()
             .filter(|k| {
                 kex::Name::try_from(*k)
                     .ok()
@@ -251,7 +259,7 @@ pub(crate) trait Select {
             } else {
                 EXTENSION_OPENSSH_STRICT_KEX_AS_SERVER
             }],
-            &parse_kex_algo_list(&kex_string),
+            &kex_algos,
             AlgorithmKind::Kex,
         )
         .is_ok();
@@ -262,7 +270,7 @@ pub(crate) trait Select {
 
         // Host key
 
-        let key_string = String::decode(&mut r)?;
+        let key_algos = take_name_list(&mut r)?;
         let possible_host_key_algos = match available_host_keys {
             Some(available_host_keys) => pref.possible_host_key_algos_for_keys(available_host_keys),
             None => pref.key.iter().map(ToOwned::to_owned).collect::<Vec<_>>(),
@@ -270,19 +278,19 @@ pub(crate) trait Select {
 
         let (key_both_first, key_algorithm) = Self::select(
             &possible_host_key_algos[..],
-            &parse_kex_algo_list(&key_string),
+            &key_algos,
             AlgorithmKind::Key,
         )?;
 
         // Cipher
 
-        let cipher_string = String::decode(&mut r)?;
+        let cipher_algos = take_name_list(&mut r)?;
         let (_cipher_both_first, cipher) = Self::select(
             &pref.cipher,
-            &parse_kex_algo_list(&cipher_string),
+            &cipher_algos,
             AlgorithmKind::Cipher,
         )?;
-        String::decode(&mut r)?; // cipher server-to-client.
+        take_name_list(&mut r)?; // cipher server-to-client.
 
         // MAC
 
@@ -290,7 +298,7 @@ pub(crate) trait Select {
 
         let client_mac = match Self::select(
             &pref.mac,
-            &parse_kex_algo_list(&String::decode(&mut r)?),
+            &take_name_list(&mut r)?,
             AlgorithmKind::Mac,
         ) {
             Ok((_, m)) => m,
@@ -304,7 +312,7 @@ pub(crate) trait Select {
         };
         let server_mac = match Self::select(
             &pref.mac,
-            &parse_kex_algo_list(&String::decode(&mut r)?),
+            &take_name_list(&mut r)?,
             AlgorithmKind::Mac,
         ) {
             Ok((_, m)) => m,
@@ -323,7 +331,7 @@ pub(crate) trait Select {
         let client_compression = compression::Compression::new(
             &Self::select(
                 &pref.compression,
-                &parse_kex_algo_list(&String::decode(&mut r)?),
+                &take_name_list(&mut r)?,
                 AlgorithmKind::Compression,
             )?
             .1,
@@ -333,15 +341,20 @@ pub(crate) trait Select {
         let server_compression = compression::Compression::new(
             &Self::select(
                 &pref.compression,
-                &parse_kex_algo_list(&String::decode(&mut r)?),
+                &take_name_list(&mut r)?,
                 AlgorithmKind::Compression,
             )?
             .1,
         );
-        String::decode(&mut r)?; // languages client-to-server
-        String::decode(&mut r)?; // languages server-to-client
+        take_name_list(&mut r)?; // languages client-to-server
+        take_name_list(&mut r)?; // languages server-to-client
 
-        let follows = u8::decode(&mut r)? != 0;
+        let follows = take_u8(&mut r)? != 0;
+        if take_u32(&mut r)? != 0 {
+            return Err(Error::KexInit);
+        }
+        ensure_end(&r)?;
+
         Ok(Names {
             kex: kex_algorithm,
             key: key_algorithm,
@@ -525,4 +538,118 @@ pub(crate) fn write_kex(
         0u32.encode(w)?; // reserved
         Ok(())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::borrow::Cow;
+
+    use byteorder::{BigEndian, ByteOrder};
+    use ssh_key::Algorithm;
+
+    use super::{Preferred, Select, Server};
+    use crate::parsing::MAX_NAME_LIST_BYTES;
+    use crate::{Error, cipher, compression, kex, mac, msg};
+
+    fn no_crypto_preferred() -> Preferred {
+        Preferred {
+            kex: Cow::Owned(vec![kex::NONE]),
+            key: Cow::Owned(vec![Algorithm::Ed25519]),
+            cipher: Cow::Owned(vec![cipher::NONE]),
+            mac: Cow::Owned(vec![mac::NONE]),
+            compression: Cow::Owned(vec![compression::NONE]),
+        }
+    }
+
+    fn encode_string(buf: &mut Vec<u8>, value: &[u8]) {
+        let mut len = [0; 4];
+        BigEndian::write_u32(&mut len, value.len() as u32);
+        buf.extend_from_slice(&len);
+        buf.extend_from_slice(value);
+    }
+
+    fn encode_name_list(buf: &mut Vec<u8>, names: &str) {
+        encode_string(buf, names.as_bytes());
+    }
+
+    fn kexinit_with_kex_list(kex_list: &str) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.push(msg::KEXINIT);
+        payload.extend_from_slice(&[0; 16]);
+        encode_name_list(&mut payload, kex_list);
+        encode_name_list(&mut payload, "ssh-ed25519");
+        encode_name_list(&mut payload, "none");
+        encode_name_list(&mut payload, "none");
+        encode_name_list(&mut payload, "none");
+        encode_name_list(&mut payload, "none");
+        encode_name_list(&mut payload, "none");
+        encode_name_list(&mut payload, "none");
+        encode_name_list(&mut payload, "");
+        encode_name_list(&mut payload, "");
+        payload.push(0);
+        payload.extend_from_slice(&[0; 4]);
+        payload
+    }
+
+    #[test]
+    fn read_kex_rejects_trailing_data() {
+        let mut payload = kexinit_with_kex_list("none");
+        payload.push(0);
+
+        assert!(Server::read_kex(
+            &payload,
+            &no_crypto_preferred(),
+            None,
+            &kex::KexCause::Initial
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn read_kex_rejects_nonzero_reserved_field() {
+        let mut payload = kexinit_with_kex_list("none");
+        let len = payload.len();
+        payload[len - 1] = 1;
+
+        assert!(matches!(
+            Server::read_kex(
+                &payload,
+                &no_crypto_preferred(),
+                None,
+                &kex::KexCause::Initial
+            ),
+            Err(Error::KexInit)
+        ));
+    }
+
+    #[test]
+    fn read_kex_rejects_empty_name_list_entries() {
+        let payload = kexinit_with_kex_list("none,,curve25519-sha256");
+
+        assert!(matches!(
+            Server::read_kex(
+                &payload,
+                &no_crypto_preferred(),
+                None,
+                &kex::KexCause::Initial
+            ),
+            Err(Error::Inconsistent)
+        ));
+    }
+
+    #[test]
+    fn read_kex_rejects_oversized_name_list_before_splitting() {
+        let huge = "a".repeat(MAX_NAME_LIST_BYTES + 1);
+        let payload = kexinit_with_kex_list(&huge);
+
+        assert!(matches!(
+            Server::read_kex(
+                &payload,
+                &no_crypto_preferred(),
+                None,
+                &kex::KexCause::Initial
+            ),
+            Err(Error::PacketSize(_))
+        ));
+    }
 }

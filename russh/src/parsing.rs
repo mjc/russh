@@ -1,8 +1,78 @@
+use byteorder::{BigEndian, ByteOrder};
 use ssh_encoding::{Decode, Encode, Reader};
 
 use crate::msg;
 
 use crate::map_err;
+
+pub(crate) const MAX_NAME_LIST_BYTES: usize = 16 * 1024;
+pub(crate) const MAX_NAME_LIST_ENTRIES: usize = 1024;
+
+pub(crate) fn ensure_end(reader: &impl Reader) -> Result<(), crate::Error> {
+    if reader.is_finished() {
+        Ok(())
+    } else {
+        Err(ssh_encoding::Error::TrailingData {
+            remaining: reader.remaining_len(),
+        }
+        .into())
+    }
+}
+
+pub(crate) fn take_u8(input: &mut &[u8]) -> Result<u8, crate::Error> {
+    let (&value, rest) = input.split_first().ok_or(ssh_encoding::Error::Length)?;
+    *input = rest;
+    Ok(value)
+}
+
+pub(crate) fn take_u32(input: &mut &[u8]) -> Result<u32, crate::Error> {
+    let (bytes, rest) = input
+        .split_at_checked(4)
+        .ok_or(ssh_encoding::Error::Length)?;
+    *input = rest;
+    Ok(BigEndian::read_u32(bytes))
+}
+
+pub(crate) fn take_bytes<'a>(
+    input: &mut &'a [u8],
+    max_len: usize,
+) -> Result<&'a [u8], crate::Error> {
+    let len = take_u32(input)? as usize;
+    if len > max_len {
+        return Err(crate::Error::PacketSize(len));
+    }
+    let (value, rest) = input
+        .split_at_checked(len)
+        .ok_or(ssh_encoding::Error::Length)?;
+    *input = rest;
+    Ok(value)
+}
+
+pub(crate) fn take_str<'a>(
+    input: &mut &'a [u8],
+    max_len: usize,
+) -> Result<&'a str, crate::Error> {
+    Ok(std::str::from_utf8(take_bytes(input, max_len)?)?)
+}
+
+pub(crate) fn take_name_list<'a>(input: &mut &'a [u8]) -> Result<Vec<&'a str>, crate::Error> {
+    let value = take_str(input, MAX_NAME_LIST_BYTES)?;
+    if value.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut names = Vec::new();
+    for name in value.split(',') {
+        if name.is_empty() {
+            return Err(crate::Error::Inconsistent);
+        }
+        if names.len() == MAX_NAME_LIST_ENTRIES {
+            return Err(crate::Error::PacketSize(names.len() + 1));
+        }
+        names.push(name);
+    }
+    Ok(names)
+}
 
 #[derive(Debug)]
 pub struct OpenChannelMessage {
@@ -19,6 +89,7 @@ impl OpenChannelMessage {
         let sender = map_err!(u32::decode(r))?;
         let window = map_err!(u32::decode(r))?;
         let maxpacket = map_err!(u32::decode(r))?;
+        validate_remote_channel_packet_size(maxpacket)?;
 
         let typ = match typ.as_str() {
             "session" => ChannelType::Session,
@@ -92,6 +163,14 @@ impl OpenChannelMessage {
             msg::SSH_OPEN_UNKNOWN_CHANNEL_TYPE,
             b"Unknown channel type",
         )
+    }
+}
+
+pub(crate) fn validate_remote_channel_packet_size(maxpacket: u32) -> Result<(), crate::Error> {
+    if maxpacket == 0 || maxpacket as usize > crate::cipher::MAXIMUM_PACKET_LEN {
+        Err(crate::Error::PacketSize(maxpacket as usize))
+    } else {
+        Ok(())
     }
 }
 
