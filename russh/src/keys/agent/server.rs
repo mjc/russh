@@ -275,14 +275,19 @@ impl<S: AsyncRead + AsyncWrite + Send + Unpin + 'static, A: Agent + Send + Sync 
 
             (private_key.public_key().key_data().encoded()?, private_key)
         };
-        writebuf.push(msg::SUCCESS);
         let mut w = self.keys.0.write().or(Err(Error::AgentFailure))?;
         let now = SystemTime::now();
         if constrained {
             let mut c = Vec::new();
+            let mut has_lifetime = false;
+            let mut has_confirm = false;
             while let Ok(t) = u8::decode(r) {
                 if t == msg::CONSTRAIN_LIFETIME {
+                    if has_lifetime {
+                        return Ok(false);
+                    }
                     let seconds = u32::decode(r)?;
+                    has_lifetime = true;
                     c.push(Constraint::KeyLifetime { seconds });
                     let blob = blob.clone();
                     let keys = self.keys.clone();
@@ -300,6 +305,10 @@ impl<S: AsyncRead + AsyncWrite + Send + Unpin + 'static, A: Agent + Send + Sync 
                         }
                     });
                 } else if t == msg::CONSTRAIN_CONFIRM {
+                    if has_confirm {
+                        return Ok(false);
+                    }
+                    has_confirm = true;
                     c.push(Constraint::Confirm)
                 } else {
                     return Ok(false);
@@ -309,6 +318,7 @@ impl<S: AsyncRead + AsyncWrite + Send + Unpin + 'static, A: Agent + Send + Sync 
         } else {
             w.insert(blob, (Arc::new(key_pair), now, Vec::new()));
         }
+        writebuf.push(msg::SUCCESS);
         Ok(true)
     }
 

@@ -41,6 +41,8 @@ const MSG_AGENT_SUCCESS: u8 = 6;
 const MSG_AGENT_SIGN_REQUEST: u8 = 13;
 const MSG_AGENT_IDENTITIES_ANSWER: u8 = 12;
 const MSG_AGENT_ADD_IDENTITY: u8 = 17;
+const MSG_AGENT_ADD_ID_CONSTRAINED: u8 = 25;
+const MSG_AGENT_CONSTRAIN_CONFIRM: u8 = 2;
 
 #[tokio::test]
 async fn malformed_pty_req_truncated_modes_rejected_by_server() {
@@ -302,6 +304,37 @@ async fn agent_server_rejects_sign_request_missing_flags() {
         sign_response.first(),
         Some(&MSG_AGENT_FAILURE),
         "agent server accepted a sign request with no flags field"
+    );
+
+    drop(client_stream);
+    serve.abort();
+}
+
+#[tokio::test]
+async fn agent_server_rejects_duplicate_confirm_constraint() {
+    let (mut client_stream, server_stream) = tokio::io::duplex(16 * 1024);
+    let listener = stream::iter(vec![Ok(server_stream)]);
+    let serve = tokio::spawn(async move {
+        let _ = russh::keys::agent::server::serve(listener, ()).await;
+    });
+
+    let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
+    let mut add_identity = Vec::new();
+    add_identity.push(MSG_AGENT_ADD_ID_CONSTRAINED);
+    key.key_data().encode(&mut add_identity).unwrap();
+    encode_string(&mut add_identity, b"");
+    add_identity.push(MSG_AGENT_CONSTRAIN_CONFIRM);
+    add_identity.push(MSG_AGENT_CONSTRAIN_CONFIRM);
+    client_stream
+        .write_all(&agent_frame(&add_identity))
+        .await
+        .unwrap();
+
+    let response = read_agent_response(&mut client_stream).await.unwrap();
+    assert_eq!(
+        response.first(),
+        Some(&MSG_AGENT_FAILURE),
+        "agent server accepted duplicate confirm constraints"
     );
 
     drop(client_stream);
